@@ -58,18 +58,21 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 | 命令 | 说明 |
 | --- | --- |
 | `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.5.exe`。**这是本项目唯一的分发方式**（便携版已移除：不再有 `dist\` 组装脚本与产物）；构建结束后自动清掉 `release\win-unpacked\`（electron-builder 的解包中间产物，里面是一份可直接双击运行的程序副本）与 `builder-debug.yml`，因此产物目录里只留**安装包 + 自动更新元数据**（`latest.yml` / `.blockmap`）。脚本内置 `--publish never`，本地打包不会误发布。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
-| `npm run check`（等同 `npm test`） | 运行 `scripts\check.js` 做静态一致性自检：UI 元素 id、IPC 通道、snapshot / env 字段、打包文件清单、版本号、设置项文档、状态徽章、语法。任何一项对不上就以非零码退出，可直接当 CI 门禁；同时锁死「只发布 nsis 安装包」 |
+| `npm run check`（等同 `npm test`） | 运行 `scripts\check.js` 做静态一致性自检：UI 元素 id、IPC 通道、snapshot / env 字段、打包文件清单、版本号、设置项文档、状态徽章、**工作流 YAML**、**安装器契约**、语法。任何一项对不上就以非零码退出，可直接当 CI 门禁。其中安装器契约校验包括：所有 `MessageBox` 带 `/SD`（静默升级不会永久阻塞）、`SetErrorLevel` 在 `Abort` 之前、安装器搬移/还原的数据目录与 `main.js` 写在程序根下的目录完全一致；并反向锁死「只发布 nsis 安装包」「不再出现便携组装脚本」「构建后清掉解包副本」「不再打开安装明细窗口」 |
 
 ### GitHub Actions 自动构建与发布
 
-推送 `v*` 标签（如 `v1.0.5`）时，GitHub Actions 会自动在 `windows-latest` 上执行：`npm ci` → `npm run check`（一致性自检）→ 校验**标签与 `package.json` 版本一致** → 补齐 Electron 运行时 → `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
+推送 `v*` 标签（如 `v1.0.5`）时，GitHub Actions 会自动在 `windows-latest` 上执行：`npm ci` → `npm run check`（一致性自检）→ **校验标签与 `package.json` 版本一致**（`scripts\check-tag.js`）→ 补齐 Electron 运行时 → `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
+
+> 工作流文件本身也在自检范围内：`npm run check` 会用 `js-yaml` 解析 `.github\workflows\*.yml`（报错带行号），并校验 `release.yml` 仍含「标签校验 / 构建 / 发布」三步。这条检查是补课来的——曾经把一段 `node -e` 脚本内联写成 `run:` 的值，脚本里的「标签与版本一致: 」含**冒号加空格**，在 YAML 里是映射分隔符，整个工作流被判 `Invalid workflow file`，本地却毫无察觉，直到打 tag 才失败。
 
 发布流程：
 
 1. 更新 `package.json` 的 `version`（安装包文件名带版本号，CI 会校验标签与它一致）；
 2. 提交并推送；
-3. 打标签并推送：`git tag v1.0.5 && git push origin v1.0.5`；
-4. 等待 Actions 完成，Release 页面即可下载 `DeepSeekHarness-Setup-<version>.exe`。
+3. 打标签前可本地预检（与 CI 同一条逻辑）：`node scripts/check-tag.js v1.0.5`；
+4. 打标签并推送：`git tag v1.0.5 && git push origin v1.0.5`；
+5. 等待 Actions 完成，Release 页面即可下载 `DeepSeekHarness-Setup-<version>.exe`。
 
 > 提示：当前安装包未做代码签名，Windows SmartScreen 可能显示"未知发布者"提示，属预期现象。
 
@@ -100,6 +103,7 @@ DeepSeekHarnessLauncher\
 ├── scripts\
 │   ├── clean.js               # 打包前清空输出目录（npm run dist 的第一步）
 │   ├── check.js               # 静态一致性自检（npm run check / npm test）
+│   ├── check-tag.js           # 校验 Git 标签与 package.json 版本一致（CI 与本地预检共用）
 │   └── installer-extra.nsh    # NSIS 安装器扩展（升级数据保留 / 卸载确认 / 目录授权）
 ├── release\                   # 安装包产物：每次 npm run dist 先清空，构建后只留安装包 + latest.yml / .blockmap
 ├── runtime\  source\  data\  config\  logs\  cache\
