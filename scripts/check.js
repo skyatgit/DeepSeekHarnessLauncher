@@ -167,8 +167,45 @@ if (!/SetErrorLevel 1[\s\S]{0,120}?Abort/.test(nsh)) fail('安装器中止前没
 if (/ShowInstDetails|ShowUninstDetails|SetDetailsPrint/.test(nsh.replace(/^\s*;.*$/gm, ''))) fail('installer-extra.nsh 又出现了 ShowInstDetails/ShowUninstDetails/SetDetailsPrint（明细窗口应保持模板默认的隐藏）')
 notes.push(`安装器契约: 数据目录 ${keepDirs.length} 个与 main.js 程序根目录一致，警告文件编码/首行、/SD、静默升级、中止语义均已校验；明细窗口保持模板默认（不显示）`)
 
+// ---------- 7c. 工作流 YAML ----------
+// 教训：release.yml 里曾经把一段 node -e 脚本直接写成未加引号的 run: 值，脚本里的
+// "标签与版本一致: " 含「冒号+空格」，在 YAML 里是映射分隔符 → 整个工作流被判
+// "Invalid workflow file"（GitHub 报第 33 行）。此前自检只看 JS 与安装器，没人解析 YAML，
+// 所以这个错误一直潜伏到打 tag 才暴露。这里补上：所有工作流必须能被 YAML 解析。
+const wfDir = path.join(root, '.github', 'workflows')
+const wfFiles = fs.existsSync(wfDir) ? fs.readdirSync(wfDir).filter((f) => /\.ya?ml$/i.test(f)) : []
+let yamlLib = null
+try { yamlLib = require('js-yaml') } catch (e) { /* 下面统一报错 */ }
+if (!yamlLib) fail('缺少 js-yaml，无法校验工作流 YAML（electron-builder 的依赖链应提供它）')
+else if (wfFiles.length === 0) fail('.github/workflows 下没有工作流文件')
+else {
+  let wfErrors = 0
+  for (const f of wfFiles) {
+    const text = fs.readFileSync(path.join(wfDir, f), 'utf8')
+    try {
+      yamlLib.load(text)
+    } catch (e) {
+      wfErrors++
+      const line = e && e.mark && typeof e.mark.line === 'number' ? e.mark.line + 1 : '?'
+      fail(`工作流 ${f} 的 YAML 语法错误（第 ${line} 行）: ${String((e && (e.reason || e.message)) || e).split('\n')[0]}`)
+    }
+  }
+  const relPath = path.join(wfDir, 'release.yml')
+  if (wfErrors === 0 && fs.existsSync(relPath)) {
+    let doc = null
+    try { doc = yamlLib.load(fs.readFileSync(relPath, 'utf8')) } catch (e) { /* 上面已报 */ }
+    const steps = (doc && doc.jobs && doc.jobs.build && doc.jobs.build.steps) || []
+    const runs = steps.map((s) => String((s && s.run) || '')).join('\n')
+    if (steps.length === 0) fail('release.yml 里找不到 build 作业的步骤（契约检查失效）')
+    if (!/GITHUB_REF_NAME|check-tag/.test(runs)) fail('release.yml 缺少「标签与 package.json 版本一致」校验步骤')
+    if (!/npm run dist/.test(runs)) fail('release.yml 缺少 npm run dist 构建步骤')
+    if (!/action-gh-release/.test(JSON.stringify(steps))) fail('release.yml 缺少发布到 GitHub Release 的步骤')
+    notes.push(`工作流: ${wfFiles.length} 个 YAML 解析通过；release.yml 含标签校验 / 构建 / 发布三步`)
+  }
+}
+
 // ---------- 8. 语法 ----------
-const jsFiles = ['main.js', 'preload.js', 'renderer.js', 'scripts/clean.js', 'scripts/check.js']
+const jsFiles = ['main.js', 'preload.js', 'renderer.js', 'scripts/check.js', 'scripts/check-tag.js', 'scripts/clean.js']
 for (const f of jsFiles) {
   try {
     new vm.Script(read(f), { filename: f }) // 只编译不执行
