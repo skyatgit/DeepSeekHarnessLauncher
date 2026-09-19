@@ -88,11 +88,12 @@ function applySnapshot(s) {
     errRow.style.display = 'none'
     errText.textContent = ''
   }
-  const idle = s.state === 'stopped' || s.state === 'error'
-  btnStart.disabled = !idle
-  btnStop.disabled = !(s.state === 'running' || s.state === 'starting' || s.state === 'stopping')
+  // 按钮可用性由主进程给出（canStart/canStop/canUpdate），与托盘菜单同一套判定：
+  // 否则会出现「面板能点启动但必然失败」「有 dsh 在跑却点不到停止」这类不一致
+  btnStart.disabled = !s.canStart
+  btnStop.disabled = !s.canStop
+  btnUpdate.disabled = !s.canUpdate
   btnWeb.disabled = !(s.tokenUrl || s.uiUrl)
-  btnUpdate.disabled = !idle
   chkAutoStart.checked = !!s.autoStartDsh
   chkAutoLogon.checked = !!s.openAtLogin
   renderStepper(s)
@@ -161,11 +162,34 @@ chkAutoStart.onchange = () => window.launcher.setAutoStartDsh(chkAutoStart.check
 chkAutoLogon.onchange = () => window.launcher.setOpenAtLogin(chkAutoLogon.checked)
 
 window.launcher.onState((s) => applySnapshot(s))
-window.launcher.onLog((line) => appendLog(line))
+
+// ---------- 日志：快照回放与实时推送会重叠，用主进程给的序号去重 ----------
+// 面板加载时先订阅实时日志、再取快照：若直接追加，两者重叠的那几行会重复显示。
+// 因此实时行先入队，等快照落地后只补「序号大于快照末尾序号」的行。
+let snapshotApplied = false
+const pendingLogs = []
+function onLogItem(item) {
+  if (!item) return
+  if (!snapshotApplied) { pendingLogs.push(item); return }
+  appendLog(item.text)
+}
+
+window.launcher.onLog(onLogItem)
 window.launcher.getEnv().then(renderEnv).catch(() => {})
 
 window.launcher.getSnapshot().then((s) => {
   applySnapshot(s)
   const lines = s.logLines || []
   for (const line of lines) appendLog(line)
-}).catch(() => {})
+  const snapSeq = typeof s.logSeq === 'number' ? s.logSeq : 0
+  for (const item of pendingLogs) {
+    if (typeof item.seq !== 'number' || item.seq > snapSeq) appendLog(item.text)
+  }
+  pendingLogs.length = 0
+  snapshotApplied = true
+}).catch(() => {
+  // 快照失败：把已收到的实时行按到达顺序补上，至少不丢日志
+  for (const item of pendingLogs) appendLog(item.text)
+  pendingLogs.length = 0
+  snapshotApplied = true
+})

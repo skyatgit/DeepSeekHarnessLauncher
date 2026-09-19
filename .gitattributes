@@ -1,0 +1,13 @@
+# 统一换行符：仓库内源码一律 LF，避免不同编辑器/工具把整份文件改成 CRLF
+* text=auto eol=lf
+
+# Windows 专用文件保持原样（如需 CRLF 可在此追加规则）
+*.ico -text
+*.exe -text
+*.dll -text
+*.png -text
+
+# 第三方目录不参与 diff 统计
+node_modules/ -diff
+dist/ -diff
+release/ -diff

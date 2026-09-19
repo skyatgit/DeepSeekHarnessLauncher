@@ -1,12 +1,12 @@
-# DeepSeekHarnessLauncher
+﻿# DeepSeekHarnessLauncher
 
 DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的 Windows 桌面启动器：一个 **Electron 托盘应用，环境全内置**。
 
 它把「下载运行时 → 拉取源码 → 安装依赖 → 构建 → 启动 Web UI」整条流程自动化，用户**无需预装 Node.js、Git 或 pnpm**，双击即用。
 
 - 仓库地址：https://github.com/skyatgit/DeepSeekHarnessLauncher
-- 应用版本：`1.0.1`（Electron `44.0.0`，electron-builder `26.x`）
-- 目标平台：Windows 10/11（x64 / ARM64）
+- 应用版本：`1.0.2`（Electron `44.0.0`，electron-builder `26.x`）
+- 目标平台：Windows 10/11 **x64**（当前只发布 x64 安装包与便携版；`main.js` 会按 `process.arch` 下载对应架构的便携运行时，ARM64 上可运行 x64 版本，但尚未提供原生 ARM64 安装包）
 - 被启动的目标：[`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness)（默认分支 `master`）
 
 ---
@@ -57,27 +57,29 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 
 | 命令 | 说明 |
 | --- | --- |
-| `npm run build` | 运行 `scripts\build.js`：组装 `dist\`——复制 Electron 运行时、重命名 `DeepSeekHarnessLauncher.exe`、把 6 个源文件拷入 `resources\app\`、备份并还原运行数据（`runtime\`/`cache\`/`data\`/`config\`/`logs\`，重建不清空环境）、用 `rcedit` 写入 exe 图标。产物 `dist\` 即自带运行时的可分发版本 |
-| `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.1.exe`。产物目录只保留本次构建结果，不会残留旧版本安装包。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
+| `npm run build` | 运行 `scripts\build.js`：组装 `dist\`——复制 Electron 运行时、重命名 `DeepSeekHarnessLauncher.exe`、把 6 个源文件拷入 `resources\app\`、备份并还原运行数据（`runtime\`/`cache\`/`data\`/`config\`/`logs\`/`source\`，重建不清空环境；中途失败会把数据放回 `dist\`，不会留在 `%TEMP%`）、用 `rcedit` 写入 exe 图标与**版本信息**（产品名/文件版本等，与安装版一致）。产物 `dist\` 即自带运行时的可分发版本 |
+| `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.2.exe`。产物目录只保留本次构建结果，不会残留旧版本安装包；脚本内置 `--publish never`，本地打包不会误发布。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
+| `npm run check`（等同 `npm test`） | 运行 `scripts\check.js` 做静态一致性自检：UI 元素 id、IPC 通道、snapshot / env 字段、打包文件清单、版本号、设置项文档、状态徽章、语法。任何一项对不上就以非零码退出，可直接当 CI 门禁 |
 
 ### GitHub Actions 自动构建与发布
 
-推送 `v*` 标签（如 `v1.0.0`）时，GitHub Actions 会自动在 `windows-latest` 上执行 `npm ci` + `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
+推送 `v*` 标签（如 `v1.0.2`）时，GitHub Actions 会自动在 `windows-latest` 上执行：`npm ci` → `npm run check`（一致性自检）→ 校验**标签与 `package.json` 版本一致** → 补齐 Electron 运行时 → `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
 
 发布流程：
 
-1. 更新 `package.json` 的 `version`（安装包文件名带版本号）；
+1. 更新 `package.json` 的 `version`（安装包文件名带版本号，CI 会校验标签与它一致）；
 2. 提交并推送；
-3. 打标签并推送：`git tag v1.0.1 && git push origin v1.0.1`；
+3. 打标签并推送：`git tag v1.0.2 && git push origin v1.0.2`；
 4. 等待 Actions 完成，Release 页面即可下载 `DeepSeekHarness-Setup-<version>.exe`。
 
 > 提示：当前安装包未做代码签名，Windows SmartScreen 可能显示"未知发布者"提示，属预期现象。
 
 ### 安装包与升级
 
-- 安装时可选择「所有用户 / 当前用户」与安装目录；选择装到 `C:\Program Files` 等受保护目录时，安装器在**安装阶段**请求管理员权限并授权该目录写入（`icacls`），**运行阶段无需管理员权限**。
-- 检测到已安装时，再次运行安装包即为**升级**：不再提供目录与安装模式选择，强制沿用原安装目录与原安装模式，并自动保留全部运行数据（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）。
+- 安装时可选择「所有用户 / 当前用户」与安装目录；选择装到 `C:\Program Files` 等受保护目录时，安装器在**安装阶段**请求管理员权限，并只把**数据目录**（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）授权给普通用户写入，程序目录本身只给「读取 + 执行」，**运行阶段无需管理员权限**；若授权失败安装器会明确警告。这样本机其他用户无法替换程序文件。
+- 检测到已安装时，再次运行安装包即为**升级**：不再提供目录与安装模式选择，强制沿用原安装目录与原安装模式，并自动保留全部运行数据（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）。数据暂存在 `%TEMP%` 再搬回，跨盘（`%TEMP%` 在别的卷）时自动改用递归复制；万一恢复失败会提示暂存目录位置，不会静默丢数据。
 - 升级前请先退出启动器（并停止 dsh），避免运行中的进程占用文件导致升级中止。
+- ⚠️ **卸载会删除数据**：走「应用和功能」卸载时，安装目录下的 `runtime\`、`source\`、`data\`（会话 / 配置 / API 密钥）、`config\`、`logs\`、`cache\` 会一并删除。安装器会弹确认框，请在确认前先手动备份需要保留的目录。
 
 ## 目录结构
 
@@ -91,10 +93,15 @@ DeepSeekHarnessLauncher\
 ├── index.html                 # 主面板界面
 ├── app.ico                    # 应用图标
 ├── package.json               # 应用清单与 electron-builder 构建配置
+├── package-lock.json          # 依赖锁定（CI 用 npm ci）
+├── LICENSE                    # MIT 许可
+├── .gitattributes / .editorconfig  # 统一换行符（LF）与缩进
+├── .github\workflows\release.yml   # 打 tag 自动构建并发布安装包
 ├── scripts\
 │   ├── build.js               # 组装 dist\（npm run build）
 │   ├── clean.js               # 打包前清空输出目录（npm run dist 的第一步）
-│   └── installer-extra.nsh    # NSIS 安装器扩展（升级数据保留 / 更新检测 / 目录授权）
+│   ├── check.js               # 静态一致性自检（npm run check / npm test）
+│   └── installer-extra.nsh    # NSIS 安装器扩展（升级数据保留 / 卸载确认 / 目录授权）
 ├── dist\                      # 构建产物（运行时生成）：自带 Electron 运行时的可分发版本
 ├── release\                   # 安装包产物（每次 npm run dist 先清空，只留本次结果）
 ├── runtime\  source\  data\  config\  logs\  cache\

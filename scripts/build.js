@@ -1,5 +1,5 @@
 // 标准构建脚本：npm run build
-// 流程：确保 Electron 运行时 → 备份运行数据 → 组装 dist → 复制源码 → 还原数据 → 设置 exe 图标
+// 流程：确保 Electron 运行时 → 备份运行数据 → 组装 dist → 复制源码 → 还原数据 → 写入图标与版本信息
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -10,9 +10,12 @@ const electronDist = path.join(root, 'node_modules', 'electron', 'dist')
 const electronInstall = path.join(root, 'node_modules', 'electron', 'install.js')
 const outDir = path.join(root, 'dist')
 const appOut = path.join(outDir, 'resources', 'app')
+const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 
 const SOURCE_FILES = ['main.js', 'preload.js', 'index.html', 'renderer.js', 'package.json', 'app.ico']
-const KEEP_DIRS = ['runtime', 'cache', 'data', 'config', 'logs']
+// 便携部署时程序根就是 dist\（main.js 会据此判定），所以这些运行数据必须跨重建保留。
+// source 同样是程序数据（克隆的源码 + node_modules + .built-sha），漏掉它等于每次重建都白等 10~30 分钟
+const KEEP_DIRS = ['runtime', 'cache', 'data', 'config', 'logs', 'source']
 
 function rmrf(p) {
   if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true })
@@ -49,42 +52,78 @@ async function main() {
   console.log('[2/4] 备份现有运行数据 ...')
   const backup = path.join(os.tmpdir(), 'dsh-dist-backup-' + Date.now())
   fs.mkdirSync(backup, { recursive: true })
-  for (const d of KEEP_DIRS) moveIfExists(path.join(outDir, d), path.join(backup, d))
+  const moved = []
+  try {
+    for (const d of KEEP_DIRS) {
+      const from = path.join(outDir, d)
+      if (fs.existsSync(from)) {
+        fs.renameSync(from, path.join(backup, d))
+        moved.push(d)
+      }
+    }
 
-  // 3. 组装 dist
-  console.log('[3/4] 组装 dist ...')
-  rmrf(outDir)
-  fs.mkdirSync(outDir, { recursive: true })
-  copyDir(electronDist, outDir)
-  fs.renameSync(path.join(outDir, 'electron.exe'), path.join(outDir, 'DeepSeekHarnessLauncher.exe'))
+    // 3. 组装 dist
+    console.log('[3/4] 组装 dist ...')
+    rmrf(outDir)
+    fs.mkdirSync(outDir, { recursive: true })
+    copyDir(electronDist, outDir)
+    fs.renameSync(path.join(outDir, 'electron.exe'), path.join(outDir, 'DeepSeekHarnessLauncher.exe'))
+    // Electron 自带的兜底应用（存在 resources\app 时不会被使用），删掉以免混淆
+    rmrf(path.join(outDir, 'resources', 'default_app.asar'))
 
-  // 4. 复制源码
-  fs.mkdirSync(appOut, { recursive: true })
-  for (const f of SOURCE_FILES) {
-    const s = path.join(root, f)
-    if (fs.existsSync(s)) fs.copyFileSync(s, path.join(appOut, f))
+    // 4. 复制源码
+    fs.mkdirSync(appOut, { recursive: true })
+    for (const f of SOURCE_FILES) {
+      const s = path.join(root, f)
+      if (fs.existsSync(s)) fs.copyFileSync(s, path.join(appOut, f))
+    }
+
+    // 还原运行数据
+    for (const d of moved) moveIfExists(path.join(backup, d), path.join(outDir, d))
+    rmrf(backup)
+  } catch (err) {
+    // 任何一步失败都不能把用户的运行数据留在 %TEMP%：先放回 dist\ 再抛出
+    try {
+      fs.mkdirSync(outDir, { recursive: true })
+      for (const d of moved) moveIfExists(path.join(backup, d), path.join(outDir, d))
+      rmrf(backup)
+      console.error('构建中断，运行数据已放回 ' + outDir)
+    } catch (e) {
+      console.error('构建中断，且运行数据未能放回！请手动从以下目录恢复：')
+      console.error('  ' + backup)
+    }
+    throw err
   }
 
-  // 还原运行数据
-  for (const d of KEEP_DIRS) moveIfExists(path.join(backup, d), path.join(outDir, d))
-  rmrf(backup)
-
-  // 5. 设置 exe 图标
+  // 5. 写入 exe 图标与版本信息
   const appIco = path.join(root, 'app.ico')
   const exe = path.join(outDir, 'DeepSeekHarnessLauncher.exe')
-  if (fs.existsSync(appIco)) {
-    console.log('[4/4] 设置 exe 图标 ...')
+  if (!fs.existsSync(appIco)) {
+    console.log('[4/4] 未找到 app.ico，跳过图标设置')
+  } else {
+    console.log('[4/4] 写入 exe 图标与版本信息 ...')
     try {
       const rcedit = require('rcedit')
-      await new Promise((resolve, reject) => {
-        rcedit(exe, { icon: appIco }, (err) => (err ? reject(err) : resolve()))
+      // rcedit 4.x 的签名是 async (exe, options)，没有回调参数。
+      // 之前用 new Promise + 回调包装 → Promise 永不 settle：await 卡住，
+      // 「图标已设置 / 构建完成」再也不打印，失败时还会变成未处理拒绝
+      await rcedit(exe, {
+        icon: appIco,
+        'version-string': {
+          CompanyName: pkg.author || 'DeepSeek Harness',
+          FileDescription: pkg.productName || pkg.name,
+          ProductName: pkg.productName || pkg.name,
+          InternalName: pkg.productName || pkg.name,
+          OriginalFilename: 'DeepSeekHarnessLauncher.exe',
+          LegalCopyright: 'Copyright © ' + (pkg.author || 'DeepSeek Harness')
+        },
+        'file-version': pkg.version + '.0',
+        'product-version': pkg.version + '.0'
       })
-      console.log('图标已设置')
+      console.log('图标与版本信息已写入（' + pkg.version + '）')
     } catch (e) {
-      console.error('警告: 图标设置失败（不影响运行）:', e.message)
+      console.error('警告: 图标/版本信息写入失败（不影响运行）:', e.message)
     }
-  } else {
-    console.log('[4/4] 未找到 app.ico，跳过图标设置')
   }
 
   console.log('')

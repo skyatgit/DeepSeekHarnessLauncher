@@ -15,6 +15,6 @@ contextBridge.exposeInMainWorld('launcher', {
   getEnv: () => ipcRenderer.invoke('get-env'),
   openPath: (p) => ipcRenderer.invoke('open-path', p),
   onState: (cb) => ipcRenderer.on('state', (_e, s) => cb(s)),
-  onLog: (cb) => ipcRenderer.on('log-line', (_e, line) => cb(line)),
+  onLog: (cb) => ipcRenderer.on('log-line', (_e, item) => cb(item)),
   onEnv: (cb) => ipcRenderer.on('env', (_e, items) => cb(items))
 })

@@ -39,17 +39,43 @@
 ; 旧卸载器会清空整个安装目录（uninstaller.nsh 的 isUpdated 分支）。本程序的环境数据
 ; （runtime/config/data/logs/source/cache）都放在安装目录里，不处理的话每次升级都会删光。
 ; 方案：升级时在删除文件之前（customUnInstall）把数据目录搬到临时目录暂存，
-; 新安装器装完文件后（customInstall）再搬回。普通卸载不搬移（数据随程序一起删除）。
+; 新安装器装完文件后（customInstall）再搬回。普通卸载不搬移，但会先弹确认。
+;
+; 搬移采用「先 Rename，失败再 xcopy 递归复制」：NSIS 的 Rename 跨盘可能失败，
+; 而 %TEMP% 被重定向到其它盘的企业环境很常见；NSIS 的 CopyFiles 不递归子目录，
+; 所以跨卷回退借用 Windows 自带的 xcopy（$SYSDIR\xcopy.exe，系统组件，无需额外依赖）。
 
-; 仅在卸载器构建中声明（主安装器构建不引用该变量，NSIS 会把未使用变量当错误）
+; 仅在需要的构建里声明标记变量（另一侧不引用，NSIS 会把未使用变量当错误）：
+; launcherRestoreFailed 两个构建都用（安装器恢复数据、卸载器回滚数据）
+Var /GLOBAL launcherRestoreFailed
 !ifdef BUILD_UNINSTALLER
   Var /GLOBAL launcherBackupFailed
+!else
+  Var /GLOBAL launcherAclFailed
 !endif
+
+; 暂存目录：!define 的值不带引号，使用处再自行加引号（NSIS 的 !define 会保留引号字符）
+!ifdef LAUNCHER_BACKUP
+  !undef LAUNCHER_BACKUP
+!endif
+!define LAUNCHER_BACKUP $TEMP\DeepSeekHarnessLauncher-update-backup
 
 !macro launcherMoveData NAME
   ${If} ${FileExists} "$INSTDIR\${NAME}\*.*"
-    RMDir /r "$TEMP\DeepSeekHarnessLauncher-update-backup\${NAME}"
-    Rename "$INSTDIR\${NAME}" "$TEMP\DeepSeekHarnessLauncher-update-backup\${NAME}"
+    RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
+    ClearErrors
+    Rename "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"
+    ${If} ${Errors}
+      ; 跨盘：递归复制后再删源
+      ClearErrors
+      DetailPrint 'Upgrade: cross-volume move of ${NAME} ...'
+      nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"'
+      Pop $0
+      ${If} $0 == 0
+        RMDir /r "$INSTDIR\${NAME}"
+      ${EndIf}
+    ${EndIf}
+    ; 搬移后源目录若还有文件，说明没搬干净
     ${If} ${FileExists} "$INSTDIR\${NAME}\*.*"
       StrCpy $launcherBackupFailed "1"
     ${EndIf}
@@ -57,17 +83,40 @@
 !macroend
 
 !macro launcherRestoreData NAME
-  ${If} ${FileExists} "$TEMP\DeepSeekHarnessLauncher-update-backup\${NAME}\*.*"
-    Rename "$TEMP\DeepSeekHarnessLauncher-update-backup\${NAME}" "$INSTDIR\${NAME}"
+  ${If} ${FileExists} "${LAUNCHER_BACKUP}\${NAME}\*.*"
+    ClearErrors
+    Rename "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"
+    ${If} ${Errors}
+      ClearErrors
+      DetailPrint 'Upgrade: cross-volume restore of ${NAME} ...'
+      nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"'
+      Pop $0
+      ${If} $0 == 0
+        RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
+      ${EndIf}
+    ${EndIf}
+    ; 暂存区若仍有文件，说明这个目录没恢复成功
+    ${If} ${FileExists} "${LAUNCHER_BACKUP}\${NAME}\*.*"
+      StrCpy $launcherRestoreFailed "1"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; 给一个目录授予标准用户「修改」权限，并检查 icacls 的退出码
+!macro launcherGrantModify PATH
+  nsExec::ExecToLog 'icacls "${PATH}" /grant:r "*S-1-5-32-545":(OI)(CI)M /Q'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $launcherAclFailed "1"
   ${EndIf}
 !macroend
 
 !macro customUnInstall
-  ; 仅在升级时备份数据目录（普通卸载则随程序一并删除）
   ${if} ${isUpdated}
+    ; ---- 升级：把数据目录搬到临时区暂存，装完再搬回 ----
     StrCpy $launcherBackupFailed ""
     DetailPrint 'Upgrade: moving data directories out of the way...'
-    CreateDirectory "$TEMP\DeepSeekHarnessLauncher-update-backup"
+    CreateDirectory "${LAUNCHER_BACKUP}"
     !insertmacro launcherMoveData config
     !insertmacro launcherMoveData runtime
     !insertmacro launcherMoveData cache
@@ -76,35 +125,69 @@
     !insertmacro launcherMoveData source
     ${If} $launcherBackupFailed == "1"
       ; 有任何目录搬不走就全部回滚并中止：宁可升级失败也不能丢数据
+      StrCpy $launcherRestoreFailed ""
       !insertmacro launcherRestoreData config
       !insertmacro launcherRestoreData runtime
       !insertmacro launcherRestoreData cache
       !insertmacro launcherRestoreData data
       !insertmacro launcherRestoreData logs
       !insertmacro launcherRestoreData source
-      MessageBox MB_OK|MB_ICONEXCLAMATION "升级中止：无法安全备份数据目录（可能有文件被占用）。请先退出启动器并停止 DeepSeek Harness 后重试。"
+      MessageBox MB_OK|MB_ICONEXCLAMATION "升级中止：无法安全备份数据目录（磁盘空间不足或文件被占用）。请先退出启动器并停止 DeepSeek Harness 后重试。"
+      ${If} $launcherRestoreFailed == "1"
+        MessageBox MB_OK|MB_ICONEXCLAMATION "注意：部分数据未能回滚到安装目录，仍保留在 ${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
+      ${EndIf}
       Abort
     ${EndIf}
+  ${else}
+    ; ---- 普通卸载：数据会随安装目录一起删除，先明确确认 ----
+    ; 注意 NSIS 的 /SD 必须写在文本之后（与 electron-builder 模板一致）
+    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION|MB_DEFBUTTON2 "卸载将删除安装目录下的全部本地数据，且无法恢复：$\r$\n$\r$\n  runtime\  （便携 Node.js / Git / pnpm）$\r$\n  source\   （DeepSeek Harness 源码与构建产物）$\r$\n  data\     （会话 / 配置 / API 密钥，DSH_HOME）$\r$\n  config\  logs\  cache\$\r$\n$\r$\n如需保留，请先取消卸载并手动备份上述目录。确定继续卸载？" /SD IDOK IDOK launcherUninstallConfirmed
+    Abort
+    launcherUninstallConfirmed:
   ${endif}
 !macroend
 
 !macro customInstall
   ; 升级时先把暂存的数据目录搬回安装目录
-  ${If} ${FileExists} "$TEMP\DeepSeekHarnessLauncher-update-backup\*.*"
+  ${If} ${FileExists} "${LAUNCHER_BACKUP}\*.*"
     DetailPrint 'Upgrade: restoring data directories...'
+    StrCpy $launcherRestoreFailed ""
     !insertmacro launcherRestoreData config
     !insertmacro launcherRestoreData runtime
     !insertmacro launcherRestoreData cache
     !insertmacro launcherRestoreData data
     !insertmacro launcherRestoreData logs
     !insertmacro launcherRestoreData source
-    RMDir "$TEMP\DeepSeekHarnessLauncher-update-backup"
+    ${If} $launcherRestoreFailed == ""
+      RMDir /r "${LAUNCHER_BACKUP}"
+    ${Else}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "部分数据未能自动恢复到安装目录，暂存内容仍保留在：$\r$\n${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
+    ${EndIf}
   ${EndIf}
-  ; 补齐目录并授权：装到 Program Files 也能在无管理员时运行
+
+  ; 补齐目录：装到 Program Files 也能在无管理员权限下运行。
+  ; 可写权限只授予这些数据目录，程序目录本身只给标准用户「读取+执行」——
+  ; 否则本机任意用户都能替换 resources\app\main.js，等下一个用户启动时执行
   CreateDirectory "$INSTDIR\config"
   CreateDirectory "$INSTDIR\runtime"
   CreateDirectory "$INSTDIR\cache"
   CreateDirectory "$INSTDIR\data"
   CreateDirectory "$INSTDIR\logs"
-  nsExec::ExecToLog 'icacls "$INSTDIR" /grant:r "*S-1-5-32-545":(OI)(CI)M /Q'
+  CreateDirectory "$INSTDIR\source"
+  StrCpy $launcherAclFailed ""
+  nsExec::ExecToLog 'icacls "$INSTDIR" /grant:r "*S-1-5-32-545":(OI)(CI)RX /Q'
+  Pop $0
+  ${If} $0 != 0
+    StrCpy $launcherAclFailed "1"
+  ${EndIf}
+  !insertmacro launcherGrantModify "$INSTDIR\config"
+  !insertmacro launcherGrantModify "$INSTDIR\runtime"
+  !insertmacro launcherGrantModify "$INSTDIR\cache"
+  !insertmacro launcherGrantModify "$INSTDIR\data"
+  !insertmacro launcherGrantModify "$INSTDIR\logs"
+  !insertmacro launcherGrantModify "$INSTDIR\source"
+  ${If} $launcherAclFailed == "1"
+    ; 授权失败不让安装失败，但启动器可能无法写入程序目录，必须明确告知
+    MessageBox MB_OK|MB_ICONEXCLAMATION "警告：未能为程序目录授予普通用户权限（icacls 失败）。$\r$\n程序已安装，但可能需要以管理员身份运行；也可以卸载后改装到用户目录（如 %LOCALAPPDATA%\Programs）。"
+  ${EndIf}
 !macroend

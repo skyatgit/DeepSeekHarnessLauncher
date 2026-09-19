@@ -25,11 +25,18 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      - name: 一致性自检（UI / IPC / 打包清单 / 版本 / 设置文档 / 语法）
+        run: npm run check
+
+      - name: 校验标签与 package.json 版本一致
+        if: github.ref_type == 'tag'
+        run: node -e "const v=require('./package.json').version; const t=process.env.GITHUB_REF_NAME.replace(/^v/,''); if(t!==v){console.error('标签 v'+t+' 与 package.json 版本 '+v+' 不一致，请先升版本再打标签'); process.exit(1)} console.log('标签与版本一致: '+v)"
+
       - name: 确保 Electron 运行时已下载（npm postinstall 可能被跳过）
         run: node node_modules/electron/install.js
 
-      - name: 构建 NSIS 安装包
-        run: npm run dist -- --publish never
+      - name: 构建 NSIS 安装包（脚本内已含清空 release 与 --publish never）
+        run: npm run dist
 
       - name: 上传构建产物（手动触发时）
         if: github.ref_type != 'tag'

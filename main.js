@@ -144,6 +144,7 @@ let envCache = null
 let envComputing = false
 let taskStep = -1 // 步骤条：当前执行到的任务步骤下标；-1 表示无进行中任务
 const logBuffer = []
+let logSeq = 0 // 日志行序号：面板据此去重（快照回放与实时推送会重叠）
 
 // 启动/更新流程的任务步骤（面板节点式步骤条）
 const TASK_STEPS = ['准备环境', '拉取源码', '安装依赖', '构建项目', '启动服务']
@@ -210,8 +211,9 @@ function log(line) {
   } catch (e) { /* 忽略 */ }
   logBuffer.push(text)
   if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift()
+  logSeq++
   if (win && !win.isDestroyed()) {
-    try { win.webContents.send('log-line', text) } catch (e) { /* 忽略 */ }
+    try { win.webContents.send('log-line', { seq: logSeq, text: text }) } catch (e) { /* 忽略 */ }
   }
 }
 
@@ -267,12 +269,28 @@ if (!gotLock) {
 }
 
 function init() {
-  ensureDefaultSettings()
-  fs.mkdirSync(homeDir, { recursive: true })
-  fs.mkdirSync(dataDir, { recursive: true })
-  createWindow()
-  tray = makeTray()
-  rebuildMenu()
+  // 程序目录不可写时（例如装到受保护目录但没有写入权限）必须给出明确提示，
+  // 否则窗口和托盘都建不出来，进程直接静默退出，用户看不到任何信息
+  try {
+    ensureDefaultSettings()
+    fs.mkdirSync(homeDir, { recursive: true })
+    fs.mkdirSync(dataDir, { recursive: true })
+  } catch (e) {
+    dialog.showErrorBox('DeepSeekHarnessLauncher 无法启动',
+      '程序目录不可写：\n' + rootDir + '\n\n' + String((e && e.message) || e) +
+      '\n\n请改用有写入权限的位置安装（例如用户目录），或以管理员身份运行。')
+    quitting = true
+    app.quit()
+    return
+  }
+  try {
+    createWindow()
+    tray = makeTray()
+    rebuildMenu()
+  } catch (e) {
+    log('创建窗口/托盘失败: ' + String((e && e.message) || e))
+    try { dialog.showErrorBox('DeepSeekHarnessLauncher 启动异常', String((e && e.message) || e)) } catch (e2) { /* 忽略 */ }
+  }
   detectExternal().catch(() => {})
   collectEnv().catch(() => {})
   if (settings.autoStartDsh && state === 'stopped' && !child && !detectExternalPid()) startFlow()
@@ -284,12 +302,13 @@ function createWindow() {
   let wa = { width: 1920, height: 1040 }
   try { wa = screen.getPrimaryDisplay().workAreaSize } catch (e) { /* 忽略 */ }
   const winWidth = Math.max(660, Math.min(wa.width - 160, 720))
-  const winHeight = Math.min(Math.max(wa.height - 60, 800), 1000)
+  // 高度必须落在可用区域内（面板本身可滚动，不再依赖固定高度）
+  const winHeight = Math.min(Math.max(wa.height - 40, 560), 1000)
   win = new BrowserWindow({
     width: winWidth,
     height: winHeight,
     minWidth: 520,
-    minHeight: 720,
+    minHeight: 560,
     title: 'DeepSeekHarnessLauncher',
     icon: appIcoPath,
     autoHideMenuBar: true,
@@ -377,6 +396,8 @@ ipcMain.handle('get-env', () => collectEnv())
 ipcMain.handle('open-path', (_e, p) => { openPath(p); return true })
 
 function snapshot() {
+  const idle = state === 'stopped' || state === 'error'
+  const recorded = !!detectExternalPid() // 有存活记录时启动/停止的口径必须与托盘一致
   return {
     state: state,
     statusText: statusText(),
@@ -388,8 +409,14 @@ function snapshot() {
     steps: TASK_STEPS,
     stepIndex: taskStep,
     stepFailed: state === 'error',
+    // 面板按钮的可用性由主进程给出：托盘菜单用的是同一套判定，
+    // 否则会出现「面板启动可点但必然失败、停止却被禁用」这类不一致
+    canStart: idle && !child && !busy && !recorded,
+    canStop: state === 'running' || state === 'starting' || state === 'stopping' || recorded,
+    canUpdate: idle && !child && !busy && !recorded,
     autoStartDsh: !!settings.autoStartDsh,
     openAtLogin: app.getLoginItemSettings().openAtLogin,
+    logSeq: logSeq,
     logLines: logBuffer.slice(-500)
   }
 }
@@ -747,6 +774,7 @@ async function startServer() {
     if (m) {
       tokenUrl = m[1]
       uiUrl = hostPortOf(tokenUrl)
+      lastError = '' // 启动成功即清掉上一次的错误横幅
       setStage('running')
       notify('DeepSeek Harness 已启动', tokenUrl)
       settle(null)
@@ -789,6 +817,7 @@ async function startServer() {
     const listening = (await probePort(port)) === 'used'
     if (listening) {
       uiUrl = settings.host + ':' + port
+      lastError = ''
       setStage('running')
       settle(null)
     } else {
@@ -826,6 +855,7 @@ async function stopDshInner() {
     }
     tokenUrl = ''
     uiUrl = ''
+    lastError = ''
     setStage('stopped')
     return
   }
@@ -853,6 +883,7 @@ async function stopDshInner() {
   clearDshPid()
   tokenUrl = ''
   uiUrl = ''
+  lastError = '' // 停止成功：清掉可能残留的错误横幅
   setStage('stopped')
   notify('DeepSeek Harness 已停止', '服务已停止')
   collectEnv().catch(() => {})
