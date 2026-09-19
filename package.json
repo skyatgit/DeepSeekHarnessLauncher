@@ -1,18 +1,17 @@
 {
   "name": "deepseek-harness-launcher",
   "productName": "DeepSeekHarnessLauncher",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "DeepSeekHarnessLauncher — DeepSeek Harness 启动器（Electron 托盘应用，环境全内置）",
   "author": "DeepSeek Harness",
   "main": "main.js",
   "private": true,
   "license": "MIT",
   "scripts": {
-    "build": "node scripts/build.js",
     "start": "electron .",
     "check": "node scripts/check.js",
     "test": "node scripts/check.js",
-    "dist": "node scripts/clean.js release && electron-builder --win nsis --publish never"
+    "dist": "node scripts/clean.js release && electron-builder --win nsis --publish never && node scripts/clean.js release/win-unpacked release/builder-debug.yml"
   },
   "devDependencies": {
     "electron": "44.0.0",

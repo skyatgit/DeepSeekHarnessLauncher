@@ -21,7 +21,6 @@ const main = read('main.js')
 const readme = read('README.md')
 const pkg = JSON.parse(read('package.json'))
 const lock = JSON.parse(read('package-lock.json'))
-const build = read(path.join('scripts', 'build.js'))
 
 // ---------- 1. UI 元素 id ----------
 const htmlIds = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]))
@@ -62,15 +61,26 @@ for (const f of readEnv) if (!envKeys.includes(f)) fail(`renderer.js 读取了 e
 notes.push(`契约: snapshot ${snapKeys.length} 个字段 / envItem ${envKeys.length} 个字段，渲染层取用全部存在`)
 
 // ---------- 4. 打包文件清单 ----------
-const srcMatch = build.match(/SOURCE_FILES = \[([^\]]+)\]/)
-if (!srcMatch) fail('scripts/build.js 中找不到 SOURCE_FILES 定义')
-const srcList = srcMatch ? srcMatch[1].split(',').map((s) => s.trim().replace(/['"]/g, '')) : []
+// 本项目只通过 NSIS 安装包分发（便携版已移除），清单以 package.json 的 build.files 为唯一来源，
+// 并反向锁死：不得再出现便携组装脚本或非 nsis 目标。
+const APP_FILES = ['main.js', 'preload.js', 'index.html', 'renderer.js', 'package.json', 'app.ico']
 const fileList = pkg.build.files
-if (JSON.stringify([...fileList].sort()) !== JSON.stringify([...srcList].sort())) {
-  fail(`package.json build.files 与 scripts/build.js SOURCE_FILES 不一致\n    files: ${fileList.join(', ')}\n    build: ${srcList.join(', ')}`)
+if (JSON.stringify([...fileList].sort()) !== JSON.stringify([...APP_FILES].sort())) {
+  fail(`package.json build.files 与约定的应用文件清单不一致\n    files: ${fileList.join(', ')}\n    约定: ${APP_FILES.join(', ')}`)
 }
 for (const f of fileList) if (!fs.existsSync(path.join(root, f))) fail(`打包清单中的文件不存在: ${f}`)
-notes.push(`打包: ${fileList.length} 个文件，两份清单一致且都存在`)
+if (fs.existsSync(path.join(root, 'scripts', 'build.js'))) fail('又出现了便携版组装脚本 scripts/build.js（本项目只通过安装包分发）')
+if (pkg.scripts && (pkg.scripts.build || pkg.scripts.portable)) fail('package.json 里又有 build/portable 脚本（本项目只通过安装包分发）')
+const winTargets = (pkg.build.win && pkg.build.win.target) || []
+for (const t of winTargets) if ((typeof t === 'string' ? t : t.target) !== 'nsis') fail(`electron-builder 里出现了非 nsis 目标: ${JSON.stringify(t)}（只发布安装包）`)
+if (!winTargets.length) fail('electron-builder 没有配置 win.target（应为 nsis）')
+// 构建完必须清掉 release\win-unpacked（那是可直接双击运行的程序副本）与 builder-debug.yml，
+// 让 release\ 只剩安装包与自动更新元数据——本项目只通过安装包使用
+const distScript = (pkg.scripts && pkg.scripts.dist) || ''
+if (!/release\/win-unpacked/.test(distScript) || !/builder-debug\.yml/.test(distScript)) {
+  fail('npm run dist 缺少构建后清理（应清掉 release/win-unpacked 与 builder-debug.yml，产物目录只留安装包）')
+}
+notes.push(`打包: ${fileList.length} 个文件与约定一致且都存在；分发方式仅 NSIS 安装包（构建后清掉解包副本）`)
 
 // ---------- 5. 版本号 ----------
 const lockRoot = lock.version
@@ -93,6 +103,8 @@ if (readme.indexOf('## 设置') < 0 || readme.indexOf('## 环境信息') < 0) {
 } else {
   const defaults = main.slice(main.indexOf('const DEFAULT_SETTINGS'), main.indexOf('let settings ='))
   const settingKeys = [...defaults.matchAll(/^\s{2}([a-zA-Z]+):/gm)].map((m) => m[1])
+  // 防止「正则失配 → 数组为空 → 循环不执行 → 静默通过」这种假绿
+  if (settingKeys.length < 8) fail(`从 DEFAULT_SETTINGS 只解析出 ${settingKeys.length} 个设置项，正则很可能失配（本组检查会静默失效）`)
   const readmeSettings = readme.slice(readme.indexOf('## 设置'), readme.indexOf('## 环境信息'))
   for (const k of settingKeys) if (!readmeSettings.includes('`' + k + '`')) fail(`README 设置表缺少配置项: ${k}`)
   notes.push(`设置: ${settingKeys.length} 项，README 全部有说明`)
@@ -106,12 +118,57 @@ for (const s of states) if (!badgeKeys.has(s)) fail(`状态 ${s} 在 renderer.js
 // stopped 走基础 .badge 配色，其余状态都应有专属样式
 const BASE_STATES = new Set(['stopped'])
 const cssStates = new Set([...html.matchAll(/\.badge\.([a-z]+)/g)].map((m) => m[1]))
+// 同样防止正则失配导致本组静默通过
+if (states.size < 5) fail(`从 main.js 只解析出 ${states.size} 个状态（setStage 正则可能失配）`)
+if (badgeKeys.size < 5) fail(`从 renderer.js 只解析出 ${badgeKeys.size} 个徽章文案（BADGE_TEXT 正则可能失配）`)
 for (const s of badgeKeys) if (!BASE_STATES.has(s) && !cssStates.has(s)) fail(`index.html 缺少 .badge.${s} 样式（徽章会没有配色）`)
 for (const s of cssStates) if (!badgeKeys.has(s)) fail(`index.html 里的 .badge.${s} 没有对应的状态文案`)
 notes.push(`状态: 主进程置位 ${states.size} 种，徽章文案与 CSS 样式全部覆盖`)
 
+// ---------- 7b. 安装器脚本与主进程之间的契约 ----------
+// 这几条以前没人查，但任何一条漂移都会造成真实后果（升级漏搬数据 / 警告文件变乱码 / 静默升级卡死）
+const nsh = read(path.join('scripts', 'installer-extra.nsh'))
+// (a) 升级要搬移/还原的数据目录必须与主进程实际写在程序根下的目录完全一致
+//     （来源从便携组装脚本改为 main.js：安装器与主进程是两个独立文件，任何一边加了目录
+//      而另一边没跟上，升级就会漏搬 / 漏还原数据）
+const keepDirs = [...new Set([...main.matchAll(/path\.join\(rootDir, '([a-zA-Z]+)'\)/g)].map((m) => m[1]))].sort()
+const movedDirs = [...new Set([...nsh.matchAll(/launcherMoveData\s+([a-z]+)/g)].map((m) => m[1]))].sort()
+const restoredDirs = [...new Set([...nsh.matchAll(/launcherRestoreData\s+([a-z]+)/g)].map((m) => m[1]))].sort()
+if (keepDirs.length === 0 || movedDirs.length === 0) fail('无法解析 main.js 的程序根目录或安装器的数据目录列表（契约检查失效）')
+else {
+  if (JSON.stringify(keepDirs) !== JSON.stringify(movedDirs)) fail(`安装器搬移的目录与 main.js 程序根目录不一致\n    main.js: ${keepDirs.join(', ')}\n    安装器搬移: ${movedDirs.join(', ')}`)
+  if (JSON.stringify(keepDirs) !== JSON.stringify(restoredDirs)) fail(`安装器还原的目录与 main.js 程序根目录不一致\n    main.js: ${keepDirs.join(', ')}\n    安装器还原: ${restoredDirs.join(', ')}`)
+}
+// (b) 警告文件必须用 UTF-16LE 写、首行必须是纯 ASCII 产品名，且 main.js 能识别这种无 BOM 的 UTF-16LE
+if (!/FileWriteUTF16LE\s+\$R8\s+"DeepSeekHarnessLauncher\$\\r\$\\n"/.test(nsh)) {
+  fail('安装器写警告文件的首行不是 FileWriteUTF16LE + 纯 ASCII 产品名（主进程的编码探测会失效）')
+}
+if (!/buf\[1\] === 0 && buf\[3\] === 0/.test(main)) fail('main.js 的 decodeTextFile 缺少「无 BOM UTF-16LE」识别分支')
+// (c) 静默执行路径上不能有缺 /SD 的 MessageBox：NSIS 会弹框并永久阻塞（升级看起来卡死）
+const bareMsgs = nsh.split(/\r?\n/).map((l, i) => [i + 1, l]).filter(([, l]) => /^\s*MessageBox/.test(l) && !/\/SD/.test(l))
+if (bareMsgs.length) fail(`安装器里有 ${bareMsgs.length} 处 MessageBox 缺 /SD（静默执行会弹框并永久阻塞）: 行 ${bareMsgs.map(([n]) => n).join(', ')}`)
+// (d) 升级分支必须静默：customUnInstall 的 ${if} ${isUpdated} 分支里不得出现弹窗
+//     （普通卸载的确认框属于正常交互，保留）
+const unStart = nsh.indexOf('!macro customUnInstall')
+const unEnd = nsh.search(/\n!macro customInstall\r?\n/)
+if (unStart < 0 || unEnd <= 0) fail('找不到 customUnInstall/customInstall 的边界，无法校验升级路径是否静默')
+else {
+  const unBody = nsh.slice(unStart, unEnd)
+  const elseIdx = unBody.search(/\$\{else\}/)
+  const upgradeBranch = elseIdx > 0 ? unBody.slice(0, elseIdx) : unBody
+  if (/^\s*MessageBox/m.test(upgradeBranch)) fail('升级分支里出现了弹窗，升级会打断用户（应只写 UPGRADE-DATA-WARNING.txt）')
+}
+// (e) 中止必须真正生效：SetErrorLevel 要在 Abort 之前
+if (!/SetErrorLevel 1[\s\S]{0,120}?Abort/.test(nsh)) fail('安装器中止前没有 SetErrorLevel 1（Abort 不影响退出码，安装器会当成成功继续装）')
+// (f) 安装明细窗口保持 electron-builder 默认（不显示）
+//     实测（同套 makensis + nsis7z 插件探针）：这个打包方式下明细里只有 app-64.7z 那一条
+//     File 的 "Extract:" 行，插件（Nsis7z）一行不打、CopyFiles 只打一条 "Copy to:"，
+//     逐文件信息不接管模板就拿不到。所以反向锁死：不得再打开明细窗口。
+if (/ShowInstDetails|ShowUninstDetails|SetDetailsPrint/.test(nsh.replace(/^\s*;.*$/gm, ''))) fail('installer-extra.nsh 又出现了 ShowInstDetails/ShowUninstDetails/SetDetailsPrint（明细窗口应保持模板默认的隐藏）')
+notes.push(`安装器契约: 数据目录 ${keepDirs.length} 个与 main.js 程序根目录一致，警告文件编码/首行、/SD、静默升级、中止语义均已校验；明细窗口保持模板默认（不显示）`)
+
 // ---------- 8. 语法 ----------
-const jsFiles = ['main.js', 'preload.js', 'renderer.js', 'scripts/build.js', 'scripts/clean.js', 'scripts/check.js']
+const jsFiles = ['main.js', 'preload.js', 'renderer.js', 'scripts/clean.js', 'scripts/check.js']
 for (const f of jsFiles) {
   try {
     new vm.Script(read(f), { filename: f }) // 只编译不执行

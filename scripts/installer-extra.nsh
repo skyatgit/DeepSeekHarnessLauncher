@@ -50,6 +50,7 @@
 Var /GLOBAL launcherRestoreFailed
 !ifdef BUILD_UNINSTALLER
   Var /GLOBAL launcherBackupFailed
+  Var /GLOBAL launcherRunning
 !else
   Var /GLOBAL launcherAclFailed
 !endif
@@ -60,44 +61,82 @@ Var /GLOBAL launcherRestoreFailed
 !endif
 !define LAUNCHER_BACKUP $TEMP\DeepSeekHarnessLauncher-update-backup
 
+; 目录里是否有真实条目（空目录也算「没有」）。NSIS 没有现成的「目录是否为空」判断，
+; 而 ${FileExists} "<目录>\*.*" 对空目录同样为真——用它判断会把空目录误当成有数据。
+; 注意：FindFirst 对 "*.*" 会**先返回 "." 伪条目**（实测如此），必须 FindNext 跳过 "." 与 ".."，
+; 否则非空目录也会被判成空目录。
+; $R5/$R6 只在本宏内使用，调用点不依赖它们的旧值
+!macro launcherDirHasEntries PATH OUT
+  StrCpy ${OUT} ""
+  ClearErrors
+  FindFirst $R5 $R6 "${PATH}\*.*"
+  ${DoWhile} $R6 != ""
+    ${If} $R6 != "."
+    ${AndIf} $R6 != ".."
+      StrCpy ${OUT} "1"
+      ${ExitDo}
+    ${EndIf}
+    ClearErrors
+    FindNext $R5 $R6
+  ${Loop}
+  FindClose $R5
+!macroend
+
 !macro launcherMoveData NAME
   ${If} ${FileExists} "$INSTDIR\${NAME}\*.*"
-    RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
-    ClearErrors
-    Rename "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"
-    ${If} ${Errors}
-      ; 跨盘：递归复制后再删源
-      ClearErrors
-      DetailPrint 'Upgrade: cross-volume move of ${NAME} ...'
-      nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"'
-      Pop $0
-      ${If} $0 == 0
-        RMDir /r "$INSTDIR\${NAME}"
-      ${EndIf}
-    ${EndIf}
-    ; 搬移后源目录若还有文件，说明没搬干净
-    ${If} ${FileExists} "$INSTDIR\${NAME}\*.*"
+    !insertmacro launcherDirHasEntries "${LAUNCHER_BACKUP}\${NAME}" $R4
+    ${If} $R4 != ""
+      ; 暂存区里还有**非空**的同名目录 ⇒ 上一次升级没能把它搬回安装目录（例如跨盘复制中途失败）。
+      ; 那份残留很可能是唯一副本，先 RMDir 再搬就等于把它删掉，所以这里判失败，
+      ; 交给 customUnInstall 回滚并中止升级，由用户按提示手动合并
+      DetailPrint 'Upgrade: leftover backup for ${NAME} found; refusing to overwrite it'
       StrCpy $launcherBackupFailed "1"
+    ${Else}
+      RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
+      ClearErrors
+      Rename "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"
+      ${If} ${Errors}
+        ; 跨盘：递归复制后再删源
+        ClearErrors
+        DetailPrint 'Upgrade: cross-volume move of ${NAME} ...'
+        nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "$INSTDIR\${NAME}" "${LAUNCHER_BACKUP}\${NAME}"'
+        Pop $0
+        ${If} $0 == 0
+          RMDir /r "$INSTDIR\${NAME}"
+        ${EndIf}
+      ${EndIf}
+      ; 搬移后源目录若还有文件，说明没搬干净
+      ${If} ${FileExists} "$INSTDIR\${NAME}\*.*"
+        StrCpy $launcherBackupFailed "1"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 !macroend
 
 !macro launcherRestoreData NAME
   ${If} ${FileExists} "${LAUNCHER_BACKUP}\${NAME}\*.*"
-    ClearErrors
-    Rename "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"
-    ${If} ${Errors}
-      ClearErrors
-      DetailPrint 'Upgrade: cross-volume restore of ${NAME} ...'
-      nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"'
-      Pop $0
-      ${If} $0 == 0
-        RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
-      ${EndIf}
-    ${EndIf}
-    ; 暂存区若仍有文件，说明这个目录没恢复成功
-    ${If} ${FileExists} "${LAUNCHER_BACKUP}\${NAME}\*.*"
+    !insertmacro launcherDirHasEntries "$INSTDIR\${NAME}" $R4
+    ${If} $R4 != ""
+      ; 安装目录里已经有非空同名目录：**绝不能**走下面的 xcopy 合并——/Y 会用暂存区里的
+      ; 旧副本覆盖安装目录的新数据，随后还会把暂存区（唯一副本）删掉。判为恢复失败并保留暂存区
+      DetailPrint 'Upgrade: ${NAME} already exists in $INSTDIR; refusing to merge backup over it'
       StrCpy $launcherRestoreFailed "1"
+    ${Else}
+      ClearErrors
+      Rename "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"
+      ${If} ${Errors}
+        ClearErrors
+        DetailPrint 'Upgrade: cross-volume restore of ${NAME} ...'
+        nsExec::ExecToLog '"$SYSDIR\xcopy.exe" /E /I /H /Y /Q "${LAUNCHER_BACKUP}\${NAME}" "$INSTDIR\${NAME}"'
+        Pop $0
+        ${If} $0 == 0
+          RMDir /r "${LAUNCHER_BACKUP}\${NAME}"
+        ${EndIf}
+      ${EndIf}
+      ; 暂存区若仍有文件，说明这个目录没恢复成功
+      ${If} ${FileExists} "${LAUNCHER_BACKUP}\${NAME}\*.*"
+        StrCpy $launcherRestoreFailed "1"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 !macroend
@@ -112,24 +151,94 @@ Var /GLOBAL launcherRestoreFailed
 !macroend
 
 ; 升级数据迁移出问题时写一份说明文件：旧卸载器**总是被静默调用**（installUtil.nsh 用
-; ExecWait '"...old-uninstaller.exe" /S /KEEP_APP_DATA ...'），而 NSIS 在静默模式下不显示
-; MessageBox，只靠弹窗用户永远看不到；写进安装目录的文件才是可靠的通知渠道。
+; ExecWait '"...old-uninstaller.exe" /S /KEEP_APP_DATA ...'），用户看不到向导界面；
+; 写进安装目录的文件才是可靠的通知渠道。
 ; LABEL 必须由调用方传入且全局唯一（本宏在安装器与卸载器里各插入一次，同名标签会编译失败）
+; 升级前先确认启动器没有在运行：它（以及它启动的 dsh）会占住 runtime\node\node.exe 等文件，
+; 使「把数据目录搬到暂存区」失败，用户看到的却是一句含糊的「无法安全备份数据目录」。
+; 关键陷阱：关闭主面板窗口只是**隐藏到托盘**，进程仍在跑——所以这里直接给出这个提示。
+; 检测方式：tasklist 按映像名过滤，命中时首行就是 "DeepSeekHarnessLauncher.exe",...
+; launcherRunning 只在卸载器构建里使用（见文件顶部的变量声明）
+
+; 探测某个文件是否正被运行中的进程占用：Windows 不允许对正在运行的映像写入，所以
+; 「以追加方式打开」失败就说明它还在跑。只用于**数据目录**里的文件——安装器已把
+; runtime\ 等数据目录授权给普通用户写，因此该判断在两种安装模式下都准确；
+; 不要用它探测 Program Files 根目录里的程序文件（那里普通用户只读，空闲文件也会被拒）
+!macro launcherProbeBusy PATH
+  ${If} ${FileExists} "${PATH}"
+    ClearErrors
+    FileOpen $R1 "${PATH}" a
+    ${If} ${Errors}
+      StrCpy $launcherRunning "1"
+    ${Else}
+      FileClose $R1
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro launcherCheckLauncherRunning
+  StrCpy $launcherRunning ""
+  ; dsh 的 node.exe 就住在 runtime\ 里：它还在跑，搬到暂存区的操作必然失败
+  !insertmacro launcherProbeBusy "$INSTDIR\runtime\node\node.exe"
+!macroend
+
+; 统一的消息框入口。两个要点：
+; 1) 必须带 /SD：旧卸载器是被 installUtil 以 /S 静默调用、并用 ExecWait 等待返回的，
+;    而没有 /SD 的 MessageBox 在静默模式下依然会弹出并**永久阻塞**，用户看到的是「升级卡住」
+;    （installUtil 还会重试，于是连环弹窗）。/SD 必须写在文本之后。
+; 2) 编译期定义 LAUNCHER_NO_UI 可让测试探针完全不弹窗（真实构建不定义它）
+!macro launcherMsg TEXT
+  !ifndef LAUNCHER_NO_UI
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${TEXT}" /SD IDOK
+  !endif
+!macroend
+
+; ============ 0. 安装明细窗口：保持 electron-builder 默认（不显示） ============
+; 模板（common.nsh:5/7）写死 ShowInstDetails nevershow / ShowUninstDetails nevershow，
+; 这里**故意不再覆盖**，安装界面就是标准安装包的进度条。
+; 原因：这个打包方式下，明细窗口里没有真正有用的内容，全靠脚本自己打行。实测结论
+; （同一套 makensis + nsis7z 插件做的探针）：
+;   · File           → 逐文件打 "Extract: <文件名>"（NSIS 里唯一会逐文件打印的指令）
+;   · SetOutPath     → "Output folder: <目录>"      CreateDirectory → "Create folder: <目录>"
+;   · CopyFiles      → 无论加不加 /SILENT 都只打一条 "Copy to: <目标目录>"（去掉 /SILENT 无效）
+;   · Nsis7z::Extract / ExtractWithDetails → 一行都不打（返回空字符串 = 成功）
+; 而 electron-builder 把整个 app 打成一个 app-64.7z 交给 Nsis7z 整包解压，再 CopyFiles 搬进
+; 安装目录（见模板 include\extractAppPackage.nsh:97/108），全程只有一条 File（就是那个 7z 包，
+; 于是明细里只有 "Extract: app-64.7z…"）。也就是说：不接管 NSIS 模板（nsis.script 或构建时
+; 改模板）就拿不到逐文件信息——所以显示明细只会给出一堆无意义的行，不如保持默认隐藏。
+; 另外这个 NSIS 构建没有编日志模块：写 LogSet 会直接编译失败（NSIS_CONFIG_LOG not defined），
+; 即"自带的 install.log"在标准工具链下也不存在（需要 customNsisBinary.debugLogging + 自定义二进制）。
+; 需要诊断时看安装目录的 UPGRADE-DATA-WARNING.txt 和启动器日志（%APPDATA%\DeepSeekHarnessLauncher\logs）。
+; 下面的 DetailPrint 行保留：明细关闭时它们什么都不显示，但开启后（改这里即可）仍是有用的步骤说明。
+
 !macro launcherWriteWarning TEXT LABEL
   ClearErrors
   FileOpen $R8 "$INSTDIR\UPGRADE-DATA-WARNING.txt" w
   IfErrors ${LABEL}
-  FileWrite $R8 "DeepSeekHarnessLauncher 升级时数据迁移出现问题$\r$\n$\r$\n"
-  FileWrite $R8 "说明：${TEXT}$\r$\n$\r$\n"
-  FileWrite $R8 "数据暂存位置：${LAUNCHER_BACKUP}$\r$\n"
-  FileWrite $R8 "请先把其中的目录手动移回 $INSTDIR（缺哪一个就移哪一个）。$\r$\n"
-  FileWrite $R8 "确认数据无误后可删除本文件。$\r$\n"
+  ; 必须用 FileWriteUTF16LE：NSIS 的 FileWrite 按**系统 ANSI 代码页**落盘（本机是 CP936），
+  ; 而启动器按 UTF-8 读，中文会变成一串替换字符——这条唯一的升级警告就白写了。
+  ; 首行写成纯 ASCII 的产品名，启动器据此识别「无 BOM 的 UTF-16LE」（见 main.js decodeTextFile）。
+  FileWriteUTF16LE $R8 "DeepSeekHarnessLauncher$\r$\n"
+  FileWriteUTF16LE $R8 "升级数据迁移出现问题$\r$\n$\r$\n"
+  FileWriteUTF16LE $R8 "说明：${TEXT}$\r$\n$\r$\n"
+  FileWriteUTF16LE $R8 "数据暂存位置：${LAUNCHER_BACKUP}$\r$\n"
+  FileWriteUTF16LE $R8 "请先把其中的目录手动移回 $INSTDIR（缺哪一个就移哪一个）。$\r$\n"
+  FileWriteUTF16LE $R8 "确认数据无误后可删除本文件。$\r$\n"
   FileClose $R8
   ${LABEL}:
 !macroend
 
 !macro customUnInstall
   ${if} ${isUpdated}
+    ; ---- 升级：先确认启动器已退出，再搬数据 ----
+    !insertmacro launcherCheckLauncherRunning
+    ${If} $launcherRunning == "1"
+      ; 不弹窗：与正常安装包一致——失败原因写进安装目录的说明文件，启动器下次启动会显示到面板日志；
+      ; 退出码非零让 installUtil 按它自己的失败流程处理
+      !insertmacro launcherWriteWarning "检测到 DeepSeek Harness（dsh）仍在运行、运行时仍被占用，本次升级在改动任何数据之前就已中止。" launcherRunningWarningDone
+      SetErrorLevel 1
+      Abort
+    ${EndIf}
     ; ---- 升级：把数据目录搬到临时区暂存，装完再搬回 ----
     StrCpy $launcherBackupFailed ""
     DetailPrint 'Upgrade: moving data directories out of the way...'
@@ -149,11 +258,8 @@ Var /GLOBAL launcherRestoreFailed
       !insertmacro launcherRestoreData data
       !insertmacro launcherRestoreData logs
       !insertmacro launcherRestoreData source
-      !insertmacro launcherWriteWarning "无法安全备份数据目录（磁盘空间不足或文件被占用），本次升级已中止。" launcherUninstallWarningDone
-      MessageBox MB_OK|MB_ICONEXCLAMATION "升级中止：无法安全备份数据目录（磁盘空间不足或文件被占用）。请先退出启动器并停止 DeepSeek Harness 后重试。"
-      ${If} $launcherRestoreFailed == "1"
-        MessageBox MB_OK|MB_ICONEXCLAMATION "注意：部分数据未能回滚到安装目录，仍保留在 ${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
-      ${EndIf}
+      !insertmacro launcherWriteWarning "无法安全备份数据目录（磁盘空间不足、文件被占用，或暂存区里还有上次未搬回的数据），本次升级已中止。" launcherUninstallWarningDone
+      ; 同样不弹窗：原因已写进说明文件，退出码非零交给 installUtil 的正常失败流程
       ; 让「中止」真正生效：Abort 只结束本节，退出码仍是 0，安装器会当成卸载成功继续往下装。
       ; SetErrorLevel 非零后，installUtil.nsh 的 uninstallOldVersion/handleUninstallResult
       ; 会弹出「卸载失败」并 Quit，升级才真的停下来。
@@ -162,9 +268,12 @@ Var /GLOBAL launcherRestoreFailed
     ${EndIf}
   ${else}
     ; ---- 普通卸载：数据会随安装目录一起删除，先明确确认 ----
-    ; 注意 NSIS 的 /SD 必须写在文本之后（与 electron-builder 模板一致）
-    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION|MB_DEFBUTTON2 "卸载将删除安装目录下的全部本地数据，且无法恢复：$\r$\n$\r$\n  runtime\  （便携 Node.js / Git / pnpm）$\r$\n  source\   （DeepSeek Harness 源码与构建产物）$\r$\n  data\     （会话 / 配置 / API 密钥，DSH_HOME）$\r$\n  config\  logs\  cache\$\r$\n$\r$\n如需保留，请先取消卸载并手动备份上述目录。确定继续卸载？" /SD IDOK IDOK launcherUninstallConfirmed
-    Abort
+    ; 注意 NSIS 的 /SD 必须写在文本之后（与 electron-builder 模板一致）：
+    ; 没有 /SD 时，静默卸载会弹框并永久阻塞
+    !ifndef LAUNCHER_NO_UI
+      MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION|MB_DEFBUTTON2 "卸载将删除安装目录下的全部本地数据，且无法恢复：$\r$\n$\r$\n  runtime\  （便携 Node.js / Git / pnpm）$\r$\n  source\   （DeepSeek Harness 源码与构建产物）$\r$\n  data\     （会话 / 配置 / API 密钥，DSH_HOME）$\r$\n  config\  logs\  cache\$\r$\n$\r$\n如需保留，请先取消卸载并手动备份上述目录。确定继续卸载？" /SD IDOK IDOK launcherUninstallConfirmed
+      Abort
+    !endif
     launcherUninstallConfirmed:
   ${endif}
 !macroend
@@ -183,9 +292,8 @@ Var /GLOBAL launcherRestoreFailed
     ${If} $launcherRestoreFailed == ""
       RMDir /r "${LAUNCHER_BACKUP}"
     ${Else}
-      ; 弹窗 + 落盘双保险：用户取消向导或中途关掉也不能丢掉这条线索
+      ; 不弹窗：原因写进安装目录的说明文件（启动器下次启动会显示到面板日志），暂存内容原样保留
       !insertmacro launcherWriteWarning "部分数据未能自动恢复到安装目录。" launcherInstallWarningDone
-      MessageBox MB_OK|MB_ICONEXCLAMATION "部分数据未能自动恢复到安装目录，暂存内容仍保留在：$\r$\n${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
     ${EndIf}
   ${EndIf}
 
@@ -211,7 +319,8 @@ Var /GLOBAL launcherRestoreFailed
   !insertmacro launcherGrantModify "$INSTDIR\logs"
   !insertmacro launcherGrantModify "$INSTDIR\source"
   ${If} $launcherAclFailed == "1"
-    ; 授权失败不让安装失败，但启动器可能无法写入程序目录，必须明确告知
-    MessageBox MB_OK|MB_ICONEXCLAMATION "警告：未能为程序目录授予普通用户权限（icacls 失败）。$\r$\n程序已安装，但可能需要以管理员身份运行；也可以卸载后改装到用户目录（如 %LOCALAPPDATA%\Programs）。"
+    ; 授权失败不让安装失败，但启动器可能无法写入程序目录，必须明确告知。
+    ; 走 launcherMsg：带 /SD（静默安装/升级时不会弹框阻塞），也支持测试用的 LAUNCHER_NO_UI
+    !insertmacro launcherMsg "警告：未能为程序目录授予普通用户权限（icacls 失败）。$\r$\n程序已安装，但可能需要以管理员身份运行；也可以卸载后改装到用户目录（如 %LOCALAPPDATA%\Programs）。"
   ${EndIf}
 !macroend

@@ -7,17 +7,18 @@ const fs = require('fs')
 const path = require('path')
 const https = require('https')
 const net = require('net')
+const os = require('os')
 const zlib = require('zlib')
 
 // ==================== 路径 ====================
 const appDir = __dirname
-// 部署态：<项目>\dist\resources\app → 程序根 = dist\
+// 部署态（安装版）：<安装目录>\resources\app → 程序根 = 安装目录
 // 开发态（npm run start，从源码运行）：<项目> 根 → 程序根 = 项目根
 const deployedRoot = path.resolve(appDir, '..', '..')
 const isDeployed = fs.existsSync(path.join(deployedRoot, 'resources', 'app', 'main.js'))
 const rootDir = isDeployed ? deployedRoot : appDir
 // Chromium 用户数据固定放用户级目录：单例锁在 Windows 上按 userData 划作用域，
-// 各版本（安装/便携/开发）只有共享 userData 才能全局互斥，无论从哪个位置运行都只允许一个实例
+// 安装版与开发版只有共享 userData 才能全局互斥，无论从哪个位置运行都只允许一个实例
 try { app.setPath('userData', path.join(app.getPath('appData'), 'DeepSeekHarnessLauncher', 'user-data')) } catch (e) { /* 忽略 */ }
 const configDir = path.join(rootDir, 'config')
 const settingsPath = path.join(configDir, 'settings.json')
@@ -306,10 +307,23 @@ function reportUpgradeWarning() {
   try {
     const f = path.join(rootDir, 'UPGRADE-DATA-WARNING.txt')
     if (!fs.existsSync(f)) return
-    const text = String(fs.readFileSync(f, 'utf8')).trim().replace(/\s*\r?\n\s*/g, ' ')
+    const text = decodeTextFile(fs.readFileSync(f)).trim().replace(/\s*\r?\n\s*/g, ' ')
     log('注意：上次升级存在数据迁移警告，详见 ' + f + ' —— ' + text)
     lastError = '上次升级存在数据迁移警告，详见 ' + f
   } catch (e) { /* 忽略 */ }
+}
+
+// 安装器写的警告文件不是 UTF-8：1.0.4 起用 NSIS 的 FileWriteUTF16LE（无 BOM 的 UTF-16LE，
+// 首行是 ASCII 文件名便于识别），更早的版本用 FileWrite（系统 ANSI 代码页，本机为 CP936）。
+// 直接按 UTF-8 读会把中文变成一堆替换字符，等于这条唯一的升级警告白写。这里按特征逐级探测
+function decodeTextFile(buf) {
+  if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) return buf.toString('utf16le', 2)
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) return buf.toString('utf8', 3)
+  // 无 BOM 的 UTF-16LE：首行是纯 ASCII，奇数字节全为 0
+  if (buf.length >= 8 && buf[1] === 0 && buf[3] === 0 && buf[5] === 0 && buf[7] === 0) return buf.toString('utf16le')
+  const utf8 = buf.toString('utf8')
+  if (!utf8.includes('\uFFFD')) return utf8
+  try { return new TextDecoder('gbk').decode(buf) } catch (e) { return utf8 }
 }
 
 // ==================== 主窗口 ====================
@@ -583,21 +597,102 @@ async function updateFlow() {
 }
 
 // ==================== 环境准备 ====================
+// 文件是否正被别的进程使用：Windows 上以「可写」方式打开正在运行的映像（exe）会被拒绝。
+// 只读打开是允许的，所以必须带写权限才能测出来
+function fileInUse(p) {
+  try {
+    const fd = fs.openSync(p, 'r+')
+    fs.closeSync(fd)
+    return false
+  } catch (e) {
+    if (!e) return false
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return false
+    return true
+  }
+}
+
+// 等文件不再被占用：占用者未必是 dsh——启动器自身的环境探测（collectEnv 会跑 node -v 与
+// node <pnpm.cjs> --version）也可能持有它，冷启动实测可达约 2 秒；另一个启动器实例在安装依赖/
+// 构建时同样会持有。所以预算给到 4 秒，只有持续占用才判定为「真的有人在用」。
+// 真正的 dsh 占用是持续的，4 秒后仍被占用就如实报错
+async function waitFileFree(p, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 4000)
+  for (;;) {
+    if (!fileInUse(p)) return true
+    if (Date.now() >= deadline) return false
+    await sleep(200)
+  }
+}
+
+// 目录替换：先把现役目录改名让位，换上新的之后再删旧的；中途失败就回滚。
+// 这样「要么旧环境完好，要么新环境就位」，不会出现两头落空。
+// 特别注意旧运行时可能正被**后台运行的 dsh** 占用（Windows 允许改名，却删不掉正在运行的 exe），
+// 那样会留下「新运行时已就位、.version 还写着旧版本、旧进程仍在跑」的错乱状态。
+// 所以在动手之前先探测占用，确认被占用就直接报错、什么都不动
+async function swapDir(src, dest, label, probeRel) {
+  const name = label || '运行时'
+  const old = dest + '.old'
+  if (probeRel) {
+    const probe = path.join(dest, probeRel)
+    if (!(await waitFileFree(probe))) {
+      throw new Error(name + '正被占用（' + probe + '）：可能是后台运行的 dsh，也可能是另一个启动器实例' +
+        '或启动器自身的环境探测。本次未替换，请稍后重试；若确实有 dsh 在运行，请先停止 dsh')
+    }
+  }
+  // 上一次替换留下的旧目录：清掉，清不掉通常是它仍被占用
+  try { fs.rmSync(old, { recursive: true, force: true }) } catch (e) { /* 下面按存在性判断给出明确错误 */ }
+  if (fs.existsSync(old)) {
+    throw new Error('上一次替换留下的 ' + old + ' 无法删除（通常仍被 dsh 占用），本次未替换：请先停止 dsh 后重试')
+  }
+  const had = fs.existsSync(dest)
+  if (had) fs.renameSync(dest, old)
+  try {
+    fs.renameSync(src, dest)
+  } catch (e) {
+    if (had && !fs.existsSync(dest)) {
+      try { fs.renameSync(old, dest) } catch (e2) { /* 回滚也失败：旧目录仍在 <dest>.old，不会丢 */ }
+    }
+    throw e
+  }
+  // 新目录已就位；删旧目录属于收尾工作
+  try { fs.rmSync(old, { recursive: true, force: true }) } catch (e) { /* 见下 */ }
+  if (fs.existsSync(old)) {
+    // 极少见：刚换上就又被别的进程打开。此时不再回滚（旧目录可能已被部分删除），
+    // 但如实记录，并交给每次启动时的清理逻辑（ensureNode/ensurePnpm 开头会尝试删除 .old）
+    log('注意：旧' + name + '目录暂时无法删除，已保留为 ' + old + '，下次启动时会再次尝试清理')
+  }
+}
+
 async function ensureNode() {
   const arch = process.arch === 'arm64' ? 'win-arm64' : 'win-x64'
   const want = settings.nodeVersion + '-' + arch
   const marker = path.join(nodeDir, '.version')
+  // 上一次替换可能留下 node.old（当时被占用删不掉）：每次启动都尽力清一次，
+  // 否则那几百 MB 会一直占着，直到下一次真正发生版本替换。
+  // 但只在现役运行时完好时才清：万一替换过程中两个 rename 都失败，.old 就是唯一可用的运行时
+  if (fs.existsSync(nodeExe)) {
+    try { fs.rmSync(nodeDir + '.old', { recursive: true, force: true }) } catch (e) { /* 仍被占用，下次再试 */ }
+  }
   if (fs.existsSync(nodeExe) && fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === want) return
   log('准备便携版 Node.js v' + settings.nodeVersion + '（' + arch + '）')
-  fs.rmSync(nodeDir, { recursive: true, force: true })
   fs.mkdirSync(runtimeDir, { recursive: true })
   const zip = path.join(cacheDir, 'node-' + want + '.zip')
   const url = settings.nodeBase + '/v' + settings.nodeVersion + '/node-v' + want + '.zip'
-  await downloadFile(url, zip, '下载 Node.js')
-  await extractZip(zip, runtimeDir, '解压 Node.js')
   const extracted = path.join(runtimeDir, 'node-v' + want)
-  if (!fs.existsSync(path.join(extracted, 'node.exe'))) throw new Error('Node.js 解压后未找到 node.exe')
-  fs.renameSync(extracted, nodeDir)
+  // 绝不能「先删现役 runtime 再下载」：下载或解压一失败，原本可用的环境就被自己毁掉了；
+  // 连 .version 标记也一起消失后，用户就算把 nodeVersion 改回原值，也得重新联网才能恢复——
+  // 而 README 承诺网络不可用时可继续用本地环境。所以先备好新版本，最后一步才替换。
+  try {
+    await downloadFile(url, zip, '下载 Node.js')
+    fs.rmSync(extracted, { recursive: true, force: true })
+    await extractZip(zip, runtimeDir, '解压 Node.js')
+    if (!fs.existsSync(path.join(extracted, 'node.exe'))) throw new Error('Node.js 解压后未找到 node.exe')
+    await swapDir(extracted, nodeDir, 'Node.js 运行时', 'node.exe')
+  } catch (e) {
+    fs.rmSync(extracted, { recursive: true, force: true }) // 清掉半成品解压目录，不留垃圾
+    const keep = fs.existsSync(nodeExe) ? '（现有 runtime 未被删除，把 nodeVersion 改回原值即可离线继续使用）' : ''
+    throw new Error(String((e && e.message) || e) + keep)
+  }
   fs.writeFileSync(marker, want)
   log('Node.js 就绪: ' + (await execVersion(nodeExe, ['-v'])))
 }
@@ -616,14 +711,31 @@ async function ensureGit() {
 
 async function ensurePnpm() {
   const marker = path.join(pnpmDir, '.version')
+  // 同上：只在现役 pnpm 完好时才清理 .old，避免删掉唯一可用的副本
+  if (fs.existsSync(pnpmJs)) {
+    try { fs.rmSync(pnpmDir + '.old', { recursive: true, force: true }) } catch (e) { /* 仍被占用，下次再试 */ }
+  }
   if (fs.existsSync(pnpmJs) && fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === settings.pnpmVersion) return
   log('准备 pnpm@' + settings.pnpmVersion)
-  fs.rmSync(pnpmDir, { recursive: true, force: true })
+  fs.mkdirSync(runtimeDir, { recursive: true })
   const npmCli = path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
-  await runOk(nodeExe, [npmCli, 'install', '--global', '--prefix', pnpmDir, 'pnpm@' + settings.pnpmVersion,
-    '--cache', path.join(cacheDir, 'npm-cache'), '--registry', settings.npmRegistry,
-    '--no-audit', '--no-fund', '--no-update-notifier'], '安装 pnpm')
-  if (!fs.existsSync(pnpmJs)) throw new Error('pnpm 安装后未找到 pnpm.cjs')
+  // 与 ensureNode 同理：先装到暂存目录，确认装好再替换现役 pnpm。
+  // 装失败/断网时旧 pnpm 原样保留，改回 pnpmVersion 即可离线继续用
+  const staging = path.join(runtimeDir, 'pnpm.staging')
+  fs.rmSync(staging, { recursive: true, force: true })
+  try {
+    await runOk(nodeExe, [npmCli, 'install', '--global', '--prefix', staging, 'pnpm@' + settings.pnpmVersion,
+      '--cache', path.join(cacheDir, 'npm-cache'), '--registry', settings.npmRegistry,
+      '--no-audit', '--no-fund', '--no-update-notifier'], '安装 pnpm')
+    if (!fs.existsSync(path.join(staging, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'))) {
+      throw new Error('pnpm 安装后未找到 pnpm.cjs')
+    }
+    await swapDir(staging, pnpmDir, 'pnpm', path.join('node_modules', 'pnpm', 'bin', 'pnpm.cjs'))
+  } catch (e) {
+    fs.rmSync(staging, { recursive: true, force: true })
+    const keep = fs.existsSync(pnpmJs) ? '（现有 pnpm 未被删除，把 pnpmVersion 改回原值即可离线继续使用）' : ''
+    throw new Error(String((e && e.message) || e) + keep)
+  }
   fs.writeFileSync(marker, settings.pnpmVersion)
   log('pnpm 就绪: ' + settings.pnpmVersion)
 }
@@ -790,7 +902,8 @@ async function startServer() {
   if (!settings.openBrowser) args.push('--no-open')
 
   child = spawn(nodeExe, args, { cwd: sourceDir, windowsHide: true, env: env, stdio: ['ignore', 'pipe', 'pipe'] })
-  writeDshPid(child.pid, port, settings.host)
+  const spawnedPid = child.pid // 固定下来：子进程 exit 后 child 会被置空，回调里不能再读 child.pid
+  writeDshPid(spawnedPid, port, settings.host)
   let settled = false
   const settle = (err) => {
     if (settled) return
@@ -801,9 +914,15 @@ async function startServer() {
     // 只取第一个地址：有局域网地址时 dsh 打印的是
     // "dsh web: <本机地址> (LAN: <局域网地址>)"，用 \S+ 会把 LAN 段一起吞进来
     const m = line.match(/dsh web:\s+(https?:\/\/[^\s()]+)/)
-    if (m) {
+    // 必须确认「还没定局、且不在退出流程中」：子进程的 'exit' 可能早于缓冲的 stdout 数据到达，
+    // 迟到的地址行若照常处理，就会把刚写好的错误状态改回「运行中」、清掉错误横幅，
+    // 还给一个已经退出的进程补写 PID 记录——面板于是谎报在运行
+    if (m && !settled && !quitting && !exiting) {
       tokenUrl = m[1]
       uiUrl = hostPortOf(tokenUrl)
+      // 把入口地址写进 PID 记录：否则启动器重启时只能去日志里找，
+      // 而日志轮转两次以后启动行早就不在读取范围内，面板会丢掉「打开 Web UI」的地址
+      writeDshPid(spawnedPid, port, settings.host, tokenUrl)
       lastError = '' // 启动成功即清掉上一次的错误横幅
       setStage('running')
       notify('DeepSeek Harness 已启动', tokenUrl)
@@ -820,8 +939,15 @@ async function startServer() {
     if (quitting || exiting) return // 退出过程中不再更新任何 UI，避免操作已销毁对象
     if (!settled) {
       settled = true
-      setStage('error', '服务启动后立即退出（代码 ' + code + '）')
-      notify('启动失败', '服务进程立即退出（代码 ' + code + '）')
+      if (spawned.__stoppedByUser) {
+        // 用户在 dsh 打印服务地址之前点了「停止」：这是正常的停止，绝不能报成启动失败
+        tokenUrl = ''
+        uiUrl = ''
+        setStage('stopped')
+      } else {
+        setStage('error', '服务启动后立即退出（代码 ' + code + '）')
+        notify('启动失败', '服务进程立即退出（代码 ' + code + '）')
+      }
     } else if (state === 'running') {
       // 服务自己退出（崩溃 / 被任务管理器结束）：地址必须一起清掉，
       // 否则面板会继续显示一个已经没有服务的地址，且「打开 Web UI」仍可点
@@ -866,6 +992,13 @@ async function startServer() {
   }
 }
 
+// 标记「这个子进程是被用户主动结束的」（只对本进程启动的 child 有效）。
+// startServer 的 exit 处理器据此区分「用户停止」与「服务自己崩了」——否则在启动过程中
+// 点停止，会先正常置为已停止、又被迟到的 exit 事件覆盖成「服务启动后立即退出」的错误态
+function markStoppedByUser(pid) {
+  if (child && child.pid === pid) child.__stoppedByUser = true
+}
+
 async function stopDsh() {
   if (stopBusy) { log('停止流程正在进行，忽略重复请求'); return }
   stopBusy = true
@@ -890,25 +1023,30 @@ async function stopDshInner() {
     return
   }
   if (target.reason === 'unknown') {
-    // 记录里的地址已不可监听，无法确认这个 PID 是否仍是 dsh。
-    // 结束它可能误杀被系统复用 PID 的无关程序，只清记录又可能留下一个仍在服务的实例，
+    // 无法确认这个 PID 是否仍是 dsh（地址不可监听 / 旧记录没有地址 / PID 已被系统复用）。
+    // 结束它可能误杀无关程序，只清记录又可能留下一个仍在服务的实例，
     // 所以在这里把选择交给用户，而不是替他决定。
     if (win && !win.isDestroyed() && !win.isVisible()) showWindow()
+    const why = target.why || 'badhost'
+    const head = why === 'recycled'
+      ? '进程 ' + pid + ' 的启动时间晚于 PID 记录的时间：当初启动的 dsh 已经退出，这个 PID 被系统复用给了别的程序。'
+      : why === 'noport'
+        ? '这条 PID 记录来自旧版本，既没有端口也没有 host，日志里也推不出服务地址，没有任何可核对的线索。'
+        : '记录中的地址（' + ((target.hosts || []).join(' / ') || '未知') + '）在本机已不可监听。'
     const choice = dialog.showMessageBoxSync(win || undefined, {
       type: 'question',
       title: '停止 DeepSeek Harness',
       message: '无法确认记录里的进程',
-      detail: '记录中的地址（' + (target.hosts || []).join(' / ') + '）在本机已不可监听，' +
-        '无法确认进程 ' + pid + ' 是否仍是上次启动的 dsh。\n\n' +
+      detail: head + '\n\n因此无法确认进程 ' + pid + ' 是否仍是上次启动的 dsh。\n\n' +
         '· 结束进程并清理记录：如果它确实是 dsh 就正常停止；如果该 PID 已被系统复用给别的程序，会误杀那个程序。\n' +
-        '· 只清理记录：不结束任何进程；若 dsh 仍在旧地址上服务，它将不再受启动器管理（可在任务管理器中结束）。',
+        '· 只清理记录：不结束任何进程；若 dsh 仍在别处服务，它将不再受启动器管理（可在任务管理器中结束）。',
       buttons: ['结束进程并清理记录', '只清理记录（不结束进程）', '取消'],
       defaultId: 1,
       cancelId: 2,
       noLink: true
     })
     if (choice === 2) return
-    if (choice === 0) { try { process.kill(pid) } catch (e) { /* 忽略 */ } }
+    if (choice === 0) { markStoppedByUser(pid); try { process.kill(pid) } catch (e) { /* 忽略 */ } }
     log(choice === 0 ? '按用户确认结束进程 ' + pid + ' 并清理记录' : '按用户选择只清理记录，未结束进程 ' + pid)
     clearDshPid()
     tokenUrl = ''
@@ -920,6 +1058,9 @@ async function stopDshInner() {
   }
   setStage('stopping', '正在停止 ...')
   const kill = () => { try { process.kill(pid) } catch (e) { /* 进程可能已退出，或权限不足（EPERM） */ } }
+  // 标记「这个子进程是被用户主动停止的」：startServer 的 exit 处理器据此避免把一次正常停止
+  // 报成「服务启动后立即退出」。首次启动最长要 13 秒，用户在这段时间里点「停止」是真实场景
+  markStoppedByUser(pid)
   kill()
   let stopped = false
   for (let i = 0; i < 24; i++) {
@@ -934,7 +1075,8 @@ async function stopDshInner() {
     // 此时既不能清 PID 记录（进程还活着），也不能谎报「已停止」
     lastError = '停止失败：进程 ' + pid + ' 未退出（可能权限不同或已被其它程序保护）'
     log(lastError)
-    notify('停止失败', lastError)
+    // notify 的 body 会被拼成「标题：正文」，这里不再重复带「停止失败：」前缀，避免日志出现双前缀
+    notify('停止失败', '进程 ' + pid + ' 未退出（可能权限不同或已被其它程序保护）')
     setStage('running', '') // 清掉「正在停止 ...」的残留描述
     collectEnv().catch(() => {})
     return
@@ -981,7 +1123,11 @@ async function probeRecordedService(rec, port) {
 // 解析「可以安全结束的 dsh PID」：本进程自己启动的天然可信；
 // 上次会话遗留的记录必须先确认其端口仍在提供服务——Windows 会复用 PID，
 // 只凭 pid 存活就下杀手可能终止一个毫不相干的进程（未保存数据丢失）。
-// 返回 { pid, reason }，reason 为 none/dead/stale/legacy/verified/own。
+// 返回 { pid, reason, hosts?, why? }，reason 为 none/dead/stale/verified/own/unknown。
+// unknown 表示「身份无法确认」，一律交给调用方询问用户，why 说明原因：
+//   badhost  记录里的地址本机已不可监听
+//   noport   旧记录没有端口，日志里也推不出地址，没有任何可核对的见证
+//   recycled 端口上有服务，但占着这个 PID 的进程启动时间晚于记录时间（PID 被复用）
 async function resolveStoppablePid() {
   if (child) return { pid: child.pid, reason: 'own' }
   const rec = readDshPidInfo()
@@ -989,15 +1135,23 @@ async function resolveStoppablePid() {
   if (!pidAlive(rec.pid)) { clearDshPid(); return { pid: 0, reason: 'dead' } }
   const fromLog = (rec.port && rec.host) ? { host: '', port: 0 } : hostPortFromLog()
   const port = rec.port || fromLog.port
-  // 旧记录且日志里也推不出端口：无从确认，按旧行为信任它（升级过渡期）
-  if (!port) return { pid: rec.pid, reason: 'legacy' }
+  // 旧记录且日志里也推不出端口：完全没有可核对的见证。旧版这里直接结束该 PID，
+  // 但「PID 还活着」证明不了它就是 dsh（Windows 会复用 PID），所以改为询问用户
+  if (!port) return { pid: rec.pid, reason: 'unknown', hosts: [], why: 'noport' }
   const probe = await probeRecordedService(rec, port)
-  if (probe.status === 'serving') return { pid: rec.pid, reason: 'verified' }
+  if (probe.status === 'serving') {
+    // 端口上有人在服务还不够：也可能是被复用 PID 的陌生进程恰好占着这个端口，
+    // 所以再用「进程启动时间 vs 记录时间」做一次反证（拿不到时间就不改变原判定）
+    if (await pidRecycled(rec)) {
+      return { pid: rec.pid, reason: 'unknown', hosts: probe.hosts, why: 'recycled' }
+    }
+    return { pid: rec.pid, reason: 'verified' }
+  }
   if (probe.status === 'unknown') {
     // 权威地址不可监听：既不能证明在服务，也不能证明已结束。
     // 这里只如实返回「无法确认」，绝不擅自结束进程（那可能误杀被复用 PID 的程序），
     // 由调用方决定怎么处理（stopDshInner 会询问用户）。
-    return { pid: rec.pid, reason: 'unknown', hosts: probe.hosts }
+    return { pid: rec.pid, reason: 'unknown', hosts: probe.hosts, why: 'badhost' }
   }
   log('PID 记录中的进程 ' + rec.pid + ' 未在端口 ' + port + ' 提供服务，按残留记录清理，不结束该进程')
   clearDshPid()
@@ -1012,11 +1166,20 @@ function dshPidFile() {
 // 记录 pid、实际使用的端口与 host：端口/host 用于在停止前确认「这个 PID 仍然是我们启动的 dsh」，
 // 因为 Windows 会复用 PID，单看 pid 存活无法区分 dsh 与后来占用同一 PID 的无关进程。
 // host 也要记：用户改了 settings.json 的 host 后重启启动器时，按新 host 探测会「探测不到」
-// 而把仍在运行的 dsh 记录误清掉
-function writeDshPid(pid, port, host) {
+// 而把仍在运行的 dsh 记录误清掉。
+// url（含 token）在拿到后补写：日志会被轮转，靠日志找回入口地址在长时间运行后必然失败
+function writeDshPid(pid, port, host, url) {
   try {
     fs.mkdirSync(runtimeDir, { recursive: true })
-    fs.writeFileSync(dshPidFile(), JSON.stringify({ pid: pid, ts: Date.now(), port: port || 0, host: String(host || '') }))
+    const prev = readDshPidInfo()
+    const same = !!(prev && prev.pid === pid)
+    // ts 必须保持首次写入的时间：它是「这个 PID 属于我们启动的进程」的时间基准，
+    // 补写 url 时若刷新 ts，进程启动时间的反证（见 pidRecycled）就会失效
+    const ts = (same && prev.ts) ? prev.ts : Date.now()
+    const keepUrl = (url === undefined && same) ? prev.url : String(url || '')
+    fs.writeFileSync(dshPidFile(), JSON.stringify({
+      pid: pid, ts: ts, port: port || 0, host: String(host || ''), url: String(keepUrl || '')
+    }))
   } catch (e) { /* 忽略 */ }
 }
 
@@ -1031,6 +1194,43 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true } catch (e) { return !!(e && e.code === 'EPERM') }
 }
 
+// 查询指定 PID 的实际启动时间（毫秒时间戳）。纯 Node 拿不到这个信息，只能借系统命令：
+// wmic 最快（Windows 10/11 大多还在），被移除的系统上退回 PowerShell；两者都拿不到就返回 0
+// ＝「无法判断」。只在准备结束遗留记录里的进程时调用，不在热路径上
+async function pidStartedAt(pid) {
+  try {
+    const out = await runCapture('wmic', ['process', 'where', 'processid=' + pid, 'get', 'CreationDate', '/value'], { timeout: 5000 })
+    // 形如 CreationDate=20260919224211.123456+480（本地时间 + 时区偏移分钟数）
+    const m = String(out || '').match(/CreationDate=(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.\d+([+-]\d+)?/)
+    if (m) {
+      const local = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])
+      return local - (m[7] ? parseInt(m[7], 10) : 0) * 60000
+    }
+  } catch (e) { /* 退回 PowerShell */ }
+  try {
+    const out = await runCapture('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      '(Get-Process -Id ' + pid + ' -ErrorAction Stop).StartTime.ToUniversalTime().Ticks'], { timeout: 8000 })
+    const ticks = parseInt(String(out || '').trim(), 10)
+    // .NET 的 DateTime.Ticks 从 0001-01-01 起算，Unix 纪元对应 621355968000000000 ticks。
+    // 注意别用 11644473600000：那是 FILETIME（1601 起算）的偏移，会算出公元 3626 年，
+    // 让「进程启动时间晚于记录时间」恒成立，进而把真实 dsh 误判成 PID 被复用
+    if (ticks > 0) return Math.round(ticks / 10000) - 62135596800000
+  } catch (e) { /* 无法判断 */ }
+  return 0
+}
+
+// 现在占着这个 PID 的进程，是不是在我们写记录之后才启动的？是 ⇒ 它不是当初那个 dsh。
+// 留 60 秒余量：正常启动的 dsh 不可能比记录时间晚这么多，而被复用的进程几乎必然晚得多。
+// 拿不到启动时间时返回 false——无法判断就沿用原判定，不引入新的不确定性
+async function pidRecycled(rec) {
+  if (!rec.ts) return false
+  const started = await pidStartedAt(rec.pid)
+  if (!started) return false
+  const recycled = started > rec.ts + 60000
+  if (recycled) log('PID ' + rec.pid + ' 的进程启动时间晚于记录时间，判定为 PID 被系统复用，不结束它')
+  return recycled
+}
+
 function readDshPidInfo() {
   try {
     const info = JSON.parse(fs.readFileSync(dshPidFile(), 'utf8'))
@@ -1040,7 +1240,8 @@ function readDshPidInfo() {
       pid: pid,
       ts: parseInt(info.ts, 10) || 0,
       port: parseInt(info.port, 10) || 0,
-      host: typeof info.host === 'string' ? info.host : ''
+      host: typeof info.host === 'string' ? info.host : '',
+      url: typeof info.url === 'string' ? info.url : ''
     }
   } catch (e) { return null }
 }
@@ -1091,15 +1292,24 @@ async function detectExternal() {
     // 用户可以从托盘/面板点「停止」清掉它，不会被永久卡住
     log('无法在 ' + probe.hosts.join(' / ') + ' 探测端口 ' + port + '（地址本机不可监听），按运行中对待记录里的进程 ' + pid)
   }
-  setStage('running')
   const last = lastUiUrlFromLog()
+  const saved = (rec && rec.url) ? rec.url : ''
   if (last) {
     uiUrl = hostPortOf(last)
     if (last.indexOf('token=') >= 0) tokenUrl = last
+  } else if (saved) {
+    // 日志里已经找不到启动行（长时间运行的 dsh 会把日志轮转掉）：改用 PID 记录里保存的地址
+    log('日志中已找不到服务地址，改用 PID 记录里保存的入口地址')
+    uiUrl = hostPortOf(saved)
+    tokenUrl = saved
   } else if (port) {
-    // 日志轮转/清空后拿不到 token 地址时，至少用端口补一个可点开的地址
+    // 记录里也没有地址时，至少用端口补一个可点开的地址
     uiUrl = settings.host + ':' + port
   }
+  // setStage 会重建托盘菜单并广播快照，而托盘「打开 Web UI」是否可用取决于 tokenUrl/uiUrl，
+  // 所以必须**先**恢复地址再置状态：反过来的话菜单和最后一次广播拿到的都是空地址，
+  // 托管（接管已运行的 dsh）后托盘那一项就永远是灰的
+  setStage('running')
   notify('检测到 DeepSeek Harness', 'dsh 已在运行（外部启动），可在此停止或打开界面')
 }
 
@@ -1422,7 +1632,23 @@ function probePort(port, host) {
         if (code === 'EADDRNOTAVAIL' || code === 'ENOTFOUND' || code === 'EINVAL') return finish('badhost')
         return finish('used')
       })
-      s.listen(port, probeHost(host), () => s.close(() => finish('free')))
+      s.listen(port, probeHost(host), () => {
+        // 绑定成功只说明「这个地址可用」，不等于没人监听：Windows 允许在别人已监听 0.0.0.0:P 时
+        // 再绑 127.0.0.1:P。虽然此时连 127.0.0.1:P 会落到后绑的那个套接字上（实测如此），
+        // 但把同一个端口号交给两个不同服务是明确的坑：用户把 settings.host 改成通配/网卡地址后
+        // dsh 会直接 EADDRINUSE，而「端口上是否还有我们的服务」也再无法区分。
+        // 所以只要实连得上，就认为这个端口已经被占用，换下一个端口。
+        s.close(() => {
+          probeListening(port, host).then((busy) => {
+            if (busy) return finish('used')
+            // 通配地址下的补漏：别人可能只绑在某块网卡地址上监听同一端口（此时 Windows 仍允许
+            // 通配绑定成功），只连回环会漏掉它，端口就被交出去，而面板给出的局域网地址其实打到
+            // 别人的服务上。逐个本机地址补一次绑定探测即可发现（被占用会立刻 EADDRINUSE）
+            if (!isWildcardHost(host)) return finish('free')
+            probeAnyLocalBind(port).then((occupied) => finish(occupied ? 'used' : 'free'))
+          })
+        })
+      })
     } catch (e) { finish('badhost') }
   })
   // 串行执行；任何意外都以 badhost 收尾——绝不把异常抛给调用方
@@ -1430,6 +1656,77 @@ function probePort(port, host) {
   const next = probeChain.then(run, run).catch(() => 'badhost')
   probeChain = next.then(() => {}, () => {})
   return next
+}
+
+// 直接连一次端口：有东西在听就返回 true。
+// 只在「地址绑定成功」之后调用，因此目标必定是本机可用地址，空闲端口会立刻
+// ECONNREFUSED，不会拖慢端口扫描（51 个端口逐个探测仍然很快）
+function probeListening(port, host) {
+  return new Promise((resolve) => {
+    let h = probeHost(host)
+    if (h === '0.0.0.0' || h === '::') h = '127.0.0.1' // 通配地址不能直接连，改连回环
+    let done = false
+    const sock = net.connect({ port: port, host: h })
+    const finish = (v) => {
+      if (done) return
+      done = true
+      try { sock.destroy() } catch (e) { /* 忽略 */ }
+      resolve(v)
+    }
+    sock.setTimeout(1500, () => finish(false))
+    sock.once('connect', () => finish(true))
+    sock.once('error', () => finish(false))
+  })
+}
+
+function isWildcardHost(host) {
+  const h = probeHost(host)
+  return h === '0.0.0.0' || h === '::'
+}
+
+// 本机可用于绑定探测的地址（只取 IPv4，上限 8 个，避免网卡特别多的机器拖慢端口扫描）
+function localBindAddresses() {
+  const list = []
+  try {
+    const nis = os.networkInterfaces() || {}
+    for (const name of Object.keys(nis)) {
+      for (const a of nis[name] || []) {
+        if (!a || !a.address || a.internal) continue
+        if (a.family !== 'IPv4') continue
+        if (!list.includes(a.address)) list.push(a.address)
+      }
+    }
+  } catch (e) { /* 拿不到网卡清单时退化为只探回环 */ }
+  return list.slice(0, 8)
+}
+
+// 逐个本机地址做绑定探测：某个地址已被监听就立刻 EADDRINUSE，不会像连接链路本地地址那样挂住
+function probeAnyLocalBind(port) {
+  const addrs = localBindAddresses()
+  return new Promise((resolve) => {
+    let i = 0
+    const next = () => {
+      if (i >= addrs.length) return resolve(false)
+      const addr = addrs[i++]
+      const s = net.createServer()
+      let done = false
+      const one = (busy) => {
+        if (done) return
+        done = true
+        try { s.close(() => {}) } catch (e) { /* 忽略 */ }
+        if (busy) return resolve(true)
+        next()
+      }
+      s.once('error', (err) => {
+        const code = (err && err.code) || ''
+        // 地址本机不可用（网卡已断开等）不算被占用
+        if (code === 'EADDRNOTAVAIL' || code === 'ENOTFOUND' || code === 'EINVAL') return one(false)
+        one(true)
+      })
+      try { s.listen(port, addr, () => one(false)) } catch (e) { one(false) }
+    }
+    next()
+  })
 }
 
 function hostPortOf(url) {
@@ -1621,7 +1918,7 @@ async function exitAppAsync() {
       else clearDshPid()
     } else if (choice === 0 && target.reason === 'unknown') {
       // 身份无法确认：宁可留着记录让下次启动继续处理，也不在退出时误杀无关进程
-      log('未结束进程 ' + pid + '（记录里的地址不可监听，无法确认身份），已保留 PID 记录供下次处理')
+      log('未结束进程 ' + pid + '（' + (target.why === 'recycled' ? 'PID 已被系统复用' : '无法确认身份') + '），已保留 PID 记录供下次处理')
     }
   }
   quitting = true
