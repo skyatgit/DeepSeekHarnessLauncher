@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DeepSeekHarnessLauncher</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --card: #171d2c;
+    --border: #2a3347;
+    --text: #e8ecf5;
+    --muted: #8b93a7;
+    --accent: #1e6feb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    user-select: none;
+    overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--card);
+  }
+  header .logo { width: 28px; height: 28px; flex-shrink: 0; }
+  header .logo img { width: 100%; height: 100%; display: block; }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header .badge {
+    margin-left: auto; padding: 4px 12px; border-radius: 999px;
+    font-size: 12px; background: #333b4d; color: #cdd5e4;
+    flex-shrink: 0;
+  }
+  .badge.running   { background: #12351f; color: #5be08a; }
+  .badge.provision { background: #3a2f12; color: #f0c45c; }
+  .badge.fetch     { background: #3a2f12; color: #f0c45c; }
+  .badge.install   { background: #3a2f12; color: #f0c45c; }
+  .badge.build     { background: #3a2f12; color: #f0c45c; }
+  .badge.starting  { background: #12263f; color: #6db6ff; }
+  .badge.updating  { background: #2d1c3d; color: #c79bf0; }
+  .badge.stopping  { background: #3a2312; color: #f0a35c; }
+  .badge.error     { background: #3d1520; color: #ff8fa3; }
+  main {
+    padding: 14px 18px;
+    display: flex; flex-direction: column; gap: 12px;
+    height: calc(100vh - 55px);
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px;
+  }
+  .kv { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .kv:first-child { margin-top: 0; }
+  .kv b { color: var(--text); font-weight: 600; }
+  .kv .stage { color: #6db6ff; }
+  .err { color: #ff8fa3; }
+  .envhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .envtitle { font-size: 12px; color: var(--muted); }
+  button.mini { padding: 3px 10px; font-size: 12px; border-radius: 6px; }
+  .envlist { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .envrow {
+    display: flex; flex-direction: column; gap: 3px; min-width: 0;
+    padding: 7px 10px; background: #141a28; border: 1px solid #232b3d; border-radius: 8px;
+  }
+  .envrow .line1 { display: flex; align-items: center; gap: 6px; }
+  .envname {
+    flex: 1; color: var(--text); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .envst { font-size: 10px; line-height: 15px; padding: 0 7px; border-radius: 999px; flex-shrink: 0; }
+  .envst.ok { background: #12351f; color: #5be08a; }
+  .envst.no { background: #3a2f12; color: #f0c45c; }
+  .envver {
+    font-family: Consolas, monospace; font-size: 11px; color: #8fb8ff;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .envpath {
+    display: flex; align-items: center; gap: 5px;
+    font-family: Consolas, monospace; font-size: 11px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer;
+  }
+  .envpath:hover { color: #6db6ff; }
+  .stepper { display: none; align-items: flex-start; padding: 12px 10px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+  .step-node { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+  .step-dot { width: 14px; height: 14px; border-radius: 50%; background: #333b4d; border: 2px solid #2a3347; }
+  .step-node.done .step-dot { background: #5be08a; border-color: #2f7a4a; }
+  .step-node.active .step-dot { background: #6db6ff; border-color: #3a7bd5; animation: stepPulse 1.2s ease-in-out infinite; }
+  .step-node.failed .step-dot { background: #ff8fa3; border-color: #8b2439; }
+  .step-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .step-node.done .step-label { color: #5be08a; }
+  .step-node.active .step-label { color: #6db6ff; }
+  .step-node.failed .step-label { color: #ff8fa3; }
+  .step-line { flex: 1; height: 2px; background: #2a3347; margin: 8px 6px 0; }
+  .step-line.done { background: #2f7a4a; }
+  @keyframes stepPulse { 0%, 100% { box-shadow: 0 0 3px #3a7bd5; } 50% { box-shadow: 0 0 10px #6db6ff; } }
+  .url-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .url-row .label { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+  .url-row a {
+    color: #6db6ff; text-decoration: none;
+    font-family: Consolas, monospace; font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer; flex: 1;
+  }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    border: 1px solid var(--border); background: #202839; color: var(--text);
+    border-radius: 8px; padding: 9px 16px; font-size: 13px; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger  { background: #8b2439; border-color: #8b2439; color: #fff; }
+  .log {
+    flex: 1; min-height: 100px;
+    background: #0a0e17; border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px;
+    overflow-y: auto;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px; line-height: 1.55; color: #aab3c8;
+    user-select: text; white-space: pre-wrap; word-break: break-all;
+  }
+  .log::-webkit-scrollbar { width: 8px; }
+  .log::-webkit-scrollbar-thumb { background: #2a3347; border-radius: 4px; }
+  .log .empty { color: var(--muted); }
+  .options { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  .options label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); }
+  input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; }
+  .footer { display: flex; gap: 8px; }
+  .footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><img src="app.ico" alt="DeepSeek"></div>
+  <h1>DeepSeekHarnessLauncher</h1>
+  <span class="badge" id="badge">已停止</span>
+</header>
+<main>
+  <div class="card">
+    <div class="kv">状态：<b id="statusDetail">已停止</b> <span class="stage" id="stageDetail"></span></div>
+    <div class="kv">监听地址：<b id="listenInfo">-</b></div>
+    <div class="url-row" id="urlRow" style="display:none">
+      <span class="label">Web UI：</span>
+      <a id="urlLink" href="#" title="点击打开 Web UI"></a>
+    </div>
+    <div class="kv">最近活动：<span id="activity">-</span></div>
+    <div class="kv err" id="errRow" style="display:none">错误：<span id="errText"></span></div>
+  </div>
+  <div class="card">
+    <div class="envhead">
+      <span class="envtitle">环境依赖（点击路径可在资源管理器中打开）</span>
+      <span><button class="mini" id="btnEnvRefresh">刷新</button></span>
+    </div>
+    <div id="envList" class="envlist"></div>
+  </div>
+  <div class="stepper" id="stepper"></div>
+  <div class="buttons">
+    <button class="primary" id="btnStart">启动</button>
+    <button class="danger" id="btnStop">停止</button>
+    <button id="btnWeb">打开 Web UI</button>
+    <button id="btnUpdate">检查并更新</button>
+  </div>
+  <div class="log" id="logBox"><div class="empty">运行日志（启动后在此实时显示完整进度）</div></div>
+  <div class="options">
+    <label><input type="checkbox" id="chkAutoStart"> 启动器启动时自动运行 dsh</label>
+    <label><input type="checkbox" id="chkAutoLogon"> 开机自启</label>
+  </div>
+  <div class="footer">
+    <button id="btnLogs">查看日志文件夹</button>
+    <button id="btnFolder">打开程序文件夹</button>
+    <div class="spacer"></div>
+    <button id="btnExit">退出</button>
+  </div>
+</main>
+<script src="renderer.js"></script>
+</body>
+</html>

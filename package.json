@@ -1,0 +1,60 @@
+{
+  "name": "deepseek-harness-launcher",
+  "productName": "DeepSeekHarnessLauncher",
+  "version": "1.0.0",
+  "description": "DeepSeekHarnessLauncher — DeepSeek Harness 启动器（Electron 托盘应用，环境全内置）",
+  "author": "DeepSeek Harness",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "start": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "44.0.0",
+    "electron-builder": "^26.15.3",
+    "rcedit": "^4.0.0"
+  },
+  "build": {
+    "appId": "com.deepseekharness.launcher",
+    "productName": "DeepSeekHarnessLauncher",
+    "asar": false,
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "package.json",
+      "app.ico"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "icon": "app.ico",
+      "executableName": "DeepSeekHarnessLauncher",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "DeepSeekHarness-Setup-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeekHarnessLauncher",
+      "uninstallDisplayName": "DeepSeekHarnessLauncher",
+      "include": "scripts/installer-extra.nsh"
+    }
+  }
+}
