@@ -111,6 +111,23 @@ Var /GLOBAL launcherRestoreFailed
   ${EndIf}
 !macroend
 
+; 升级数据迁移出问题时写一份说明文件：旧卸载器**总是被静默调用**（installUtil.nsh 用
+; ExecWait '"...old-uninstaller.exe" /S /KEEP_APP_DATA ...'），而 NSIS 在静默模式下不显示
+; MessageBox，只靠弹窗用户永远看不到；写进安装目录的文件才是可靠的通知渠道。
+; LABEL 必须由调用方传入且全局唯一（本宏在安装器与卸载器里各插入一次，同名标签会编译失败）
+!macro launcherWriteWarning TEXT LABEL
+  ClearErrors
+  FileOpen $R8 "$INSTDIR\UPGRADE-DATA-WARNING.txt" w
+  IfErrors ${LABEL}
+  FileWrite $R8 "DeepSeekHarnessLauncher 升级时数据迁移出现问题$\r$\n$\r$\n"
+  FileWrite $R8 "说明：${TEXT}$\r$\n$\r$\n"
+  FileWrite $R8 "数据暂存位置：${LAUNCHER_BACKUP}$\r$\n"
+  FileWrite $R8 "请先把其中的目录手动移回 $INSTDIR（缺哪一个就移哪一个）。$\r$\n"
+  FileWrite $R8 "确认数据无误后可删除本文件。$\r$\n"
+  FileClose $R8
+  ${LABEL}:
+!macroend
+
 !macro customUnInstall
   ${if} ${isUpdated}
     ; ---- 升级：把数据目录搬到临时区暂存，装完再搬回 ----
@@ -132,10 +149,15 @@ Var /GLOBAL launcherRestoreFailed
       !insertmacro launcherRestoreData data
       !insertmacro launcherRestoreData logs
       !insertmacro launcherRestoreData source
+      !insertmacro launcherWriteWarning "无法安全备份数据目录（磁盘空间不足或文件被占用），本次升级已中止。" launcherUninstallWarningDone
       MessageBox MB_OK|MB_ICONEXCLAMATION "升级中止：无法安全备份数据目录（磁盘空间不足或文件被占用）。请先退出启动器并停止 DeepSeek Harness 后重试。"
       ${If} $launcherRestoreFailed == "1"
         MessageBox MB_OK|MB_ICONEXCLAMATION "注意：部分数据未能回滚到安装目录，仍保留在 ${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
       ${EndIf}
+      ; 让「中止」真正生效：Abort 只结束本节，退出码仍是 0，安装器会当成卸载成功继续往下装。
+      ; SetErrorLevel 非零后，installUtil.nsh 的 uninstallOldVersion/handleUninstallResult
+      ; 会弹出「卸载失败」并 Quit，升级才真的停下来。
+      SetErrorLevel 1
       Abort
     ${EndIf}
   ${else}
@@ -161,6 +183,8 @@ Var /GLOBAL launcherRestoreFailed
     ${If} $launcherRestoreFailed == ""
       RMDir /r "${LAUNCHER_BACKUP}"
     ${Else}
+      ; 弹窗 + 落盘双保险：用户取消向导或中途关掉也不能丢掉这条线索
+      !insertmacro launcherWriteWarning "部分数据未能自动恢复到安装目录。" launcherInstallWarningDone
       MessageBox MB_OK|MB_ICONEXCLAMATION "部分数据未能自动恢复到安装目录，暂存内容仍保留在：$\r$\n${LAUNCHER_BACKUP}$\r$\n请手动移回安装目录后再删除该文件夹。"
     ${EndIf}
   ${EndIf}

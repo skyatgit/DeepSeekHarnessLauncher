@@ -289,11 +289,27 @@ function init() {
     rebuildMenu()
   } catch (e) {
     log('创建窗口/托盘失败: ' + String((e && e.message) || e))
-    try { dialog.showErrorBox('DeepSeekHarnessLauncher 启动异常', String((e && e.message) || e)) } catch (e2) { /* 忽略 */ }
+    try {
+      dialog.showErrorBox('DeepSeekHarnessLauncher 托盘创建失败',
+        String((e && e.message) || e) + '\n\n主面板仍可使用（启动 / 停止 / 退出），但关闭窗口后将无法从托盘唤回。')
+    } catch (e2) { /* 忽略 */ }
   }
   detectExternal().catch(() => {})
   collectEnv().catch(() => {})
+  reportUpgradeWarning()
   if (settings.autoStartDsh && state === 'stopped' && !child && !detectExternalPid()) startFlow()
+}
+
+// 上次升级若出现数据迁移问题，安装器会写一份说明文件（静默卸载时弹窗看不到）；
+// 启动时把它显示到主面板日志里，避免这类警告被永久埋没
+function reportUpgradeWarning() {
+  try {
+    const f = path.join(rootDir, 'UPGRADE-DATA-WARNING.txt')
+    if (!fs.existsSync(f)) return
+    const text = String(fs.readFileSync(f, 'utf8')).trim().replace(/\s*\r?\n\s*/g, ' ')
+    log('注意：上次升级存在数据迁移警告，详见 ' + f + ' —— ' + text)
+    lastError = '上次升级存在数据迁移警告，详见 ' + f
+  } catch (e) { /* 忽略 */ }
 }
 
 // ==================== 主窗口 ====================
@@ -456,18 +472,27 @@ async function isEnvReady() {
 // ==================== 完整启动流程 ====================
 async function startFlow() {
   if (busy || child) { log('已有任务正在进行，忽略本次启动请求'); return }
+  // 重新读取 settings.json：改过 host/port/版本等设置后无需重启启动器，再点一次即可生效
+  // （否则「host 填错 → 启动必然失败」的提示会让按钮变成一个无法兑现的承诺）
+  loadSettings()
   busy = true // 先占位：后面的端口确认是异步的，期间不能再受理第二次启动
   lastError = ''
   try {
     if (detectExternalPid()) {
       // 有记录还不够：系统会复用 PID，先确认记录里的端口真的有服务在听
       const rec = readDshPidInfo()
-      const port = rec ? (rec.port || portFromLogUrl()) : 0
-      const st = port ? await probePort(port) : 'used'
-      if (st === 'badhost') {
-        throw new Error('无法确认 dsh 状态：settings.json 的 host（' + settings.host + '）在本机无法监听')
+      const fromLog = rec && !(rec.port && rec.host) ? hostPortFromLog() : { host: '', port: 0 }
+      const port = (rec && rec.port) || fromLog.port || 0
+      const probe = (port && rec) ? await probeRecordedService(rec, port) : { status: 'serving', hosts: [] }
+      if (probe.status === 'serving') { setStage('running'); return }
+      if (probe.status === 'unknown') {
+        // 记录里的地址不可用，探测不出结论：按「仍在运行」处理并说明如何解除，
+        // 但不能抛错卡住启动（那会让用户只能手删 runtime\dsh.pid）
+        log('无法在 ' + probe.hosts.join(' / ') + ' 探测端口 ' + port + '（地址本机不可监听）；' +
+          '若确认该 dsh 已不需要，请先在托盘或面板点「停止」，或结束进程后删除 runtime\\dsh.pid')
+        setStage('running')
+        return
       }
-      if (st === 'used') { setStage('running'); return }
       log('PID 记录中的进程未在端口 ' + port + ' 提供服务，按残留记录清理，继续启动')
       clearDshPid()
     }
@@ -508,12 +533,16 @@ async function startFlow() {
     notify('启动失败', msg)
   } finally {
     busy = false
+    // busy 参与 canStart/canUpdate 的计算，而最后一次 setStage 是在 busy 复位之前广播的：
+    // 这里必须再推一次快照，否则流程结束后面板的启动/更新按钮会一直停在禁用态
+    broadcast()
     collectEnv().catch(() => {})
   }
 }
 
 async function updateFlow() {
   if (busy || child) { log('已有任务正在进行，忽略本次更新请求'); return }
+  loadSettings() // 与 startFlow 一致：改过设置后无需重启启动器
   busy = true
   lastError = ''
   try {
@@ -548,6 +577,7 @@ async function updateFlow() {
     notify('更新失败', msg)
   } finally {
     busy = false
+    broadcast() // 同 startFlow：busy 复位后必须再推一次，否则面板按钮停在禁用态
     collectEnv().catch(() => {})
   }
 }
@@ -760,7 +790,7 @@ async function startServer() {
   if (!settings.openBrowser) args.push('--no-open')
 
   child = spawn(nodeExe, args, { cwd: sourceDir, windowsHide: true, env: env, stdio: ['ignore', 'pipe', 'pipe'] })
-  writeDshPid(child.pid, port)
+  writeDshPid(child.pid, port, settings.host)
   let settled = false
   const settle = (err) => {
     if (settled) return
@@ -793,16 +823,23 @@ async function startServer() {
       setStage('error', '服务启动后立即退出（代码 ' + code + '）')
       notify('启动失败', '服务进程立即退出（代码 ' + code + '）')
     } else if (state === 'running') {
+      // 服务自己退出（崩溃 / 被任务管理器结束）：地址必须一起清掉，
+      // 否则面板会继续显示一个已经没有服务的地址，且「打开 Web UI」仍可点
       tokenUrl = ''
+      uiUrl = ''
       setStage('stopped')
       notify('DeepSeek Harness 已停止', '服务已停止')
     }
+    // child 从非空变成 null 会影响 canStart/canStop/canUpdate。上面两个分支不一定都走到
+    // ——例如面板点「停止」时 stopDshInner 已经 setStage('stopped')，而那一刻 child 还没被清空，
+    // 面板就会一直停在「按钮全灰」。所以这里必须无条件再推一次快照。
+    broadcast()
   })
   child.on('error', (err) => {
     // spawn 失败只会触发 error + close（不触发 exit），必须在这里清掉 child，
     // 否则 child 永远为真，之后所有「启动」都会被「已有任务正在进行」挡掉
     if (child === spawned) { child = null; clearDshPid() }
-    if (!settled) { settled = true; setStage('error', '无法启动: ' + err.message) }
+    if (!settled) { settled = true; setStage('error', '无法启动: ' + err.message) } else broadcast()
   })
   // 兜底等待：捕获到地址行后立即结束；否则最多等 START_TIMEOUT_MS（60 秒）。
   // dsh 首次启动要加载整个插件树，实测出现过 13 秒，原来的 15 秒上限会误杀正常启动
@@ -845,18 +882,40 @@ async function stopDshInner() {
   const target = await resolveStoppablePid()
   const pid = target.pid
   if (!pid) {
-    if (target.reason === 'badhost') {
-      // 地址不可监听 => 无法判定，既不下杀手也不清记录，如实报告
-      lastError = '无法确认 dsh 状态：settings.json 的 host（' + settings.host + '）在本机无法监听，请修正后重试'
-      log(lastError)
-      notify('停止失败', lastError)
-      setStage('running', '')
-      return
-    }
+    // none / dead / stale：没有可停止的目标（残留记录已被清掉），如实回到已停止
     tokenUrl = ''
     uiUrl = ''
     lastError = ''
     setStage('stopped')
+    return
+  }
+  if (target.reason === 'unknown') {
+    // 记录里的地址已不可监听，无法确认这个 PID 是否仍是 dsh。
+    // 结束它可能误杀被系统复用 PID 的无关程序，只清记录又可能留下一个仍在服务的实例，
+    // 所以在这里把选择交给用户，而不是替他决定。
+    if (win && !win.isDestroyed() && !win.isVisible()) showWindow()
+    const choice = dialog.showMessageBoxSync(win || undefined, {
+      type: 'question',
+      title: '停止 DeepSeek Harness',
+      message: '无法确认记录里的进程',
+      detail: '记录中的地址（' + (target.hosts || []).join(' / ') + '）在本机已不可监听，' +
+        '无法确认进程 ' + pid + ' 是否仍是上次启动的 dsh。\n\n' +
+        '· 结束进程并清理记录：如果它确实是 dsh 就正常停止；如果该 PID 已被系统复用给别的程序，会误杀那个程序。\n' +
+        '· 只清理记录：不结束任何进程；若 dsh 仍在旧地址上服务，它将不再受启动器管理（可在任务管理器中结束）。',
+      buttons: ['结束进程并清理记录', '只清理记录（不结束进程）', '取消'],
+      defaultId: 1,
+      cancelId: 2,
+      noLink: true
+    })
+    if (choice === 2) return
+    if (choice === 0) { try { process.kill(pid) } catch (e) { /* 忽略 */ } }
+    log(choice === 0 ? '按用户确认结束进程 ' + pid + ' 并清理记录' : '按用户选择只清理记录，未结束进程 ' + pid)
+    clearDshPid()
+    tokenUrl = ''
+    uiUrl = ''
+    lastError = ''
+    setStage('stopped')
+    collectEnv().catch(() => {})
     return
   }
   setStage('stopping', '正在停止 ...')
@@ -889,22 +948,57 @@ async function stopDshInner() {
   collectEnv().catch(() => {})
 }
 
+// 判断 PID 记录里的 dsh 是否仍在提供服务：返回 { status: 'serving'|'stale'|'unknown', hosts }
+//
+// 两类地址要分开看：
+//  - 「在服务」的见证：任一候选地址上有服务在听即可（记录里的 host / 日志里的 host / 当前 settings.host）
+//  - 「不在服务」的见证：只认**最权威的地址**，即记录里的 host，其次当前 settings.host。
+//    日志里的地址不能用来证明「没有服务」——dsh 无论绑在哪个地址，都会先打印本机回环地址
+//    （127.0.0.1），拿它去探测必然空闲，会把绑在局域网地址上的活实例误判成残留。
+//  - 权威地址不可监听（badhost，例如网卡/VPN 变化）时返回 unknown：既不能证明在服务，
+//    也不能证明不在服务，交给调用方决定（当前是询问用户），绝不擅自结束进程或清记录。
+async function probeRecordedService(rec, port) {
+  const fromLog = (rec.port && rec.host) ? { host: '' } : hostPortFromLog()
+  const authoritative = String(rec.host || settings.host || '').trim() // 唯一能证明「不在服务」的地址
+  const others = []
+  for (const h of [rec.host, fromLog.host, settings.host]) {
+    const v = String(h || '').trim()
+    if (v && v !== authoritative && !others.includes(v)) others.push(v)
+  }
+
+  if (authoritative) {
+    const st = await probePort(port, authoritative)
+    if (st === 'used') return { status: 'serving', hosts: [authoritative].concat(others) }
+    if (st === 'free') return { status: 'stale', hosts: [authoritative].concat(others) }
+  }
+  // 权威地址探测不出结论（或压根没有）：再看别的候选地址上有没有服务在听
+  for (const h of others) {
+    if ((await probePort(port, h)) === 'used') return { status: 'serving', hosts: [authoritative].concat(others).filter(Boolean) }
+  }
+  return { status: 'unknown', hosts: [authoritative].concat(others).filter(Boolean) }
+}
+
 // 解析「可以安全结束的 dsh PID」：本进程自己启动的天然可信；
 // 上次会话遗留的记录必须先确认其端口仍在提供服务——Windows 会复用 PID，
 // 只凭 pid 存活就下杀手可能终止一个毫不相干的进程（未保存数据丢失）。
-// 返回 { pid, reason }，reason 为 none/dead/stale/badhost/legacy/verified/own。
+// 返回 { pid, reason }，reason 为 none/dead/stale/legacy/verified/own。
 async function resolveStoppablePid() {
   if (child) return { pid: child.pid, reason: 'own' }
   const rec = readDshPidInfo()
   if (!rec) return { pid: 0, reason: 'none' }
   if (!pidAlive(rec.pid)) { clearDshPid(); return { pid: 0, reason: 'dead' } }
-  const port = rec.port || portFromLogUrl()
-  // 旧记录且日志里也推不出端口：无从确认，按老行为信任它（升级过渡期）
+  const fromLog = (rec.port && rec.host) ? { host: '', port: 0 } : hostPortFromLog()
+  const port = rec.port || fromLog.port
+  // 旧记录且日志里也推不出端口：无从确认，按旧行为信任它（升级过渡期）
   if (!port) return { pid: rec.pid, reason: 'legacy' }
-  const st = await probePort(port)
-  if (st === 'used') return { pid: rec.pid, reason: 'verified' }
-  // 地址不可监听 = 探测不出结论：既不下杀手，也不清记录
-  if (st === 'badhost') return { pid: 0, reason: 'badhost' }
+  const probe = await probeRecordedService(rec, port)
+  if (probe.status === 'serving') return { pid: rec.pid, reason: 'verified' }
+  if (probe.status === 'unknown') {
+    // 权威地址不可监听：既不能证明在服务，也不能证明已结束。
+    // 这里只如实返回「无法确认」，绝不擅自结束进程（那可能误杀被复用 PID 的程序），
+    // 由调用方决定怎么处理（stopDshInner 会询问用户）。
+    return { pid: rec.pid, reason: 'unknown', hosts: probe.hosts }
+  }
   log('PID 记录中的进程 ' + rec.pid + ' 未在端口 ' + port + ' 提供服务，按残留记录清理，不结束该进程')
   clearDshPid()
   return { pid: 0, reason: 'stale' }
@@ -915,12 +1009,14 @@ function dshPidFile() {
   return path.join(runtimeDir, 'dsh.pid')
 }
 
-// 记录 pid 与实际使用的端口：端口用于在停止前确认「这个 PID 仍然是我们启动的 dsh」，
-// 因为 Windows 会复用 PID，单看 pid 存活无法区分 dsh 与后来占用同一 PID 的无关进程
-function writeDshPid(pid, port) {
+// 记录 pid、实际使用的端口与 host：端口/host 用于在停止前确认「这个 PID 仍然是我们启动的 dsh」，
+// 因为 Windows 会复用 PID，单看 pid 存活无法区分 dsh 与后来占用同一 PID 的无关进程。
+// host 也要记：用户改了 settings.json 的 host 后重启启动器时，按新 host 探测会「探测不到」
+// 而把仍在运行的 dsh 记录误清掉
+function writeDshPid(pid, port, host) {
   try {
     fs.mkdirSync(runtimeDir, { recursive: true })
-    fs.writeFileSync(dshPidFile(), JSON.stringify({ pid: pid, ts: Date.now(), port: port || 0 }))
+    fs.writeFileSync(dshPidFile(), JSON.stringify({ pid: pid, ts: Date.now(), port: port || 0, host: String(host || '') }))
   } catch (e) { /* 忽略 */ }
 }
 
@@ -940,7 +1036,12 @@ function readDshPidInfo() {
     const info = JSON.parse(fs.readFileSync(dshPidFile(), 'utf8'))
     const pid = parseInt(info && info.pid, 10)
     if (!(pid > 0)) return null
-    return { pid: pid, ts: parseInt(info.ts, 10) || 0, port: parseInt(info.port, 10) || 0 }
+    return {
+      pid: pid,
+      ts: parseInt(info.ts, 10) || 0,
+      port: parseInt(info.port, 10) || 0,
+      host: typeof info.host === 'string' ? info.host : ''
+    }
   } catch (e) { return null }
 }
 
@@ -949,20 +1050,24 @@ function detectExternalPid() {
   try {
     const info = readDshPidInfo()
     if (!info) { if (fs.existsSync(dshPidFile())) clearDshPid(); return 0 }
-    // 超过 24 小时视为残留记录
-    if (info.ts && Date.now() - info.ts > 24 * 3600 * 1000) { clearDshPid(); return 0 }
+    // 不按时间过期：记录里的 ts 只在启动时写一次，按时间丢弃会把「健康运行超过 24 小时」的
+    // dsh 直接遗忘——进程还在服务、记录却没了，于是停止会谎报已停止、再启动会出现两个实例。
+    // 防误判靠端口校验（resolveStoppablePid / detectExternal / startFlow），不是靠时间。
     // 只有确认进程真的不存在才清记录；EPERM（权限不足）说明它还活着
     if (!pidAlive(info.pid)) { clearDshPid(); return 0 }
     return info.pid
   } catch (e) { return 0 }
 }
 
-// 从日志里推断 dsh 上次使用的端口（旧版 PID 记录没有 port 字段时的兜底）
-function portFromLogUrl() {
+// 从日志里推断 dsh 上次使用的 host 与端口（旧版 PID 记录没有这两个字段时的兜底）
+function hostPortFromLog() {
   const hp = hostPortOf(lastUiUrlFromLog())
   const i = hp.lastIndexOf(':')
   const n = i >= 0 ? parseInt(hp.slice(i + 1), 10) : 0
-  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : 0
+  return {
+    host: i > 0 ? hp.slice(0, i) : '',
+    port: Number.isInteger(n) && n >= 1 && n <= 65535 ? n : 0
+  }
 }
 
 async function detectExternal() {
@@ -970,20 +1075,21 @@ async function detectExternal() {
   if (!pid) return
   const before = state // 探测期间用户可能已触发别的流程，回来时不再抢状态
   const rec = readDshPidInfo()
-  const port = rec ? (rec.port || portFromLogUrl()) : 0
-  const st = port ? await probePort(port) : 'used'
-  if (st === 'free') {
-    // 端口明确空闲 => 这条记录里的 PID 已被系统复用给别的进程，不能据此宣称 dsh 在运行
+  const fromLog = rec && !(rec.port && rec.host) ? hostPortFromLog() : { host: '', port: 0 }
+  const port = (rec && rec.port) || fromLog.port || 0
+  const probe = port && rec ? await probeRecordedService(rec, port) : { status: 'serving', hosts: [] }
+  if (probe.status === 'stale') {
+    // 端口在「记录里的地址」上明确空闲 => 这条记录已被系统复用给别的进程，不能据此宣称 dsh 在运行
     log('PID 记录中的进程 ' + pid + ' 未在端口 ' + port + ' 提供服务，按残留记录清理')
     clearDshPid()
     if (state === before) setStage('stopped')
     return
   }
   if (state !== before) return
-  if (st === 'badhost') {
-    // 地址不可监听：既无法确认也无法否认，如实报错（记录保留，用户可从托盘停止/修复设置）
-    setStage('error', '无法确认 dsh 状态：settings.json 的 host（' + settings.host + '）在本机无法监听')
-    return
+  if (probe.status === 'unknown') {
+    // 记录里的地址已经不可用：探测不出结论。仍然按「在运行」对待（不是错误态），
+    // 用户可以从托盘/面板点「停止」清掉它，不会被永久卡住
+    log('无法在 ' + probe.hosts.join(' / ') + ' 探测端口 ' + port + '（地址本机不可监听），按运行中对待记录里的进程 ' + pid)
   }
   setStage('running')
   const last = lastUiUrlFromLog()
@@ -1284,10 +1390,10 @@ function extractZip(zip, destDir, label) {
   return count
 }
 
-// dsh 绑定的是 settings.host，探测必须用同一个地址：
+// dsh 绑定的是 settings.host（或记录里的 host），探测必须用同一个地址：
 // 只探 127.0.0.1 时，占用具体网卡地址的进程会被漏判，导致把冲突端口交给 dsh
-function probeHost() {
-  const h = String(settings.host || '127.0.0.1').trim()
+function probeHost(override) {
+  const h = String(override || settings.host || '127.0.0.1').trim()
   return (h === '' || h === '*') ? '0.0.0.0' : h
 }
 
@@ -1298,7 +1404,7 @@ function probeHost() {
 // 探测本身要占用端口，因此必须串行：两个并发探测同一个空闲端口会互相把对方挤成
 // 「被占用」（一个真正占住了，另一个拿到 EADDRINUSE），使状态判定随机化
 let probeChain = Promise.resolve()
-function probePort(port) {
+function probePort(port, host) {
   const run = () => new Promise((resolve) => {
     let s = null
     let done = false
@@ -1316,7 +1422,7 @@ function probePort(port) {
         if (code === 'EADDRNOTAVAIL' || code === 'ENOTFOUND' || code === 'EINVAL') return finish('badhost')
         return finish('used')
       })
-      s.listen(port, probeHost(), () => s.close(() => finish('free')))
+      s.listen(port, probeHost(host), () => s.close(() => finish('free')))
     } catch (e) { finish('badhost') }
   })
   // 串行执行；任何意外都以 badhost 收尾——绝不把异常抛给调用方
@@ -1507,12 +1613,15 @@ async function exitAppAsync() {
       noLink: true
     })
     if (choice === 2) { exiting = false; return }
-    if (choice === 0 && pid) {
+    if (choice === 0 && pid && target.reason !== 'unknown') {
       try { process.kill(pid) } catch (e) { /* 忽略 */ }
       // 等它真的退出；仍在运行就保留 PID 记录，下次启动还能继续接管
       for (let i = 0; i < 8 && pidAlive(pid); i++) await sleep(250)
       if (pidAlive(pid)) log('退出时未能结束进程 ' + pid + '（可能权限不足），已保留 PID 记录供下次接管')
       else clearDshPid()
+    } else if (choice === 0 && target.reason === 'unknown') {
+      // 身份无法确认：宁可留着记录让下次启动继续处理，也不在退出时误杀无关进程
+      log('未结束进程 ' + pid + '（记录里的地址不可监听，无法确认身份），已保留 PID 记录供下次处理')
     }
   }
   quitting = true

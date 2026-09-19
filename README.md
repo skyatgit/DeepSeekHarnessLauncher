@@ -1,11 +1,11 @@
-﻿# DeepSeekHarnessLauncher
+# DeepSeekHarnessLauncher
 
 DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的 Windows 桌面启动器：一个 **Electron 托盘应用，环境全内置**。
 
 它把「下载运行时 → 拉取源码 → 安装依赖 → 构建 → 启动 Web UI」整条流程自动化，用户**无需预装 Node.js、Git 或 pnpm**，双击即用。
 
 - 仓库地址：https://github.com/skyatgit/DeepSeekHarnessLauncher
-- 应用版本：`1.0.2`（Electron `44.0.0`，electron-builder `26.x`）
+- 应用版本：`1.0.3`（Electron `44.0.0`，electron-builder `26.x`）
 - 目标平台：Windows 10/11 **x64**（当前只发布 x64 安装包与便携版；`main.js` 会按 `process.arch` 下载对应架构的便携运行时，ARM64 上可运行 x64 版本，但尚未提供原生 ARM64 安装包）
 - 被启动的目标：[`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness)（默认分支 `master`）
 
@@ -58,18 +58,18 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 | 命令 | 说明 |
 | --- | --- |
 | `npm run build` | 运行 `scripts\build.js`：组装 `dist\`——复制 Electron 运行时、重命名 `DeepSeekHarnessLauncher.exe`、把 6 个源文件拷入 `resources\app\`、备份并还原运行数据（`runtime\`/`cache\`/`data\`/`config\`/`logs\`/`source\`，重建不清空环境；中途失败会把数据放回 `dist\`，不会留在 `%TEMP%`）、用 `rcedit` 写入 exe 图标与**版本信息**（产品名/文件版本等，与安装版一致）。产物 `dist\` 即自带运行时的可分发版本 |
-| `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.2.exe`。产物目录只保留本次构建结果，不会残留旧版本安装包；脚本内置 `--publish never`，本地打包不会误发布。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
+| `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.3.exe`。产物目录只保留本次构建结果，不会残留旧版本安装包；脚本内置 `--publish never`，本地打包不会误发布。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
 | `npm run check`（等同 `npm test`） | 运行 `scripts\check.js` 做静态一致性自检：UI 元素 id、IPC 通道、snapshot / env 字段、打包文件清单、版本号、设置项文档、状态徽章、语法。任何一项对不上就以非零码退出，可直接当 CI 门禁 |
 
 ### GitHub Actions 自动构建与发布
 
-推送 `v*` 标签（如 `v1.0.2`）时，GitHub Actions 会自动在 `windows-latest` 上执行：`npm ci` → `npm run check`（一致性自检）→ 校验**标签与 `package.json` 版本一致** → 补齐 Electron 运行时 → `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
+推送 `v*` 标签（如 `v1.0.3`）时，GitHub Actions 会自动在 `windows-latest` 上执行：`npm ci` → `npm run check`（一致性自检）→ 校验**标签与 `package.json` 版本一致** → 补齐 Electron 运行时 → `npm run dist`，并把生成的安装包发布到对应 tag 的 GitHub Release；也可在 Actions 页面手动触发构建（`workflow_dispatch`），产物作为构建工件下载。
 
 发布流程：
 
 1. 更新 `package.json` 的 `version`（安装包文件名带版本号，CI 会校验标签与它一致）；
 2. 提交并推送；
-3. 打标签并推送：`git tag v1.0.2 && git push origin v1.0.2`；
+3. 打标签并推送：`git tag v1.0.3 && git push origin v1.0.3`；
 4. 等待 Actions 完成，Release 页面即可下载 `DeepSeekHarness-Setup-<version>.exe`。
 
 > 提示：当前安装包未做代码签名，Windows SmartScreen 可能显示"未知发布者"提示，属预期现象。
@@ -77,7 +77,7 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 ### 安装包与升级
 
 - 安装时可选择「所有用户 / 当前用户」与安装目录；选择装到 `C:\Program Files` 等受保护目录时，安装器在**安装阶段**请求管理员权限，并只把**数据目录**（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）授权给普通用户写入，程序目录本身只给「读取 + 执行」，**运行阶段无需管理员权限**；若授权失败安装器会明确警告。这样本机其他用户无法替换程序文件。
-- 检测到已安装时，再次运行安装包即为**升级**：不再提供目录与安装模式选择，强制沿用原安装目录与原安装模式，并自动保留全部运行数据（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）。数据暂存在 `%TEMP%` 再搬回，跨盘（`%TEMP%` 在别的卷）时自动改用递归复制；万一恢复失败会提示暂存目录位置，不会静默丢数据。
+- 检测到已安装时，再次运行安装包即为**升级**：不再提供目录与安装模式选择，强制沿用原安装目录与原安装模式，并自动保留全部运行数据（`runtime\` / `config\` / `data\` / `logs\` / `source\` / `cache\`）。数据暂存在 `%TEMP%` 再搬回，跨盘（`%TEMP%` 在别的卷）时自动改用递归复制；万一迁移或恢复失败，安装器会**中止升级并报错**，同时在安装目录写下 `UPGRADE-DATA-WARNING.txt`（记录暂存位置），启动器下次启动会把它显示到主面板日志里——不会静默丢数据。
 - 升级前请先退出启动器（并停止 dsh），避免运行中的进程占用文件导致升级中止。
 - ⚠️ **卸载会删除数据**：走「应用和功能」卸载时，安装目录下的 `runtime\`、`source\`、`data\`（会话 / 配置 / API 密钥）、`config\`、`logs\`、`cache\` 会一并删除。安装器会弹确认框，请在确认前先手动备份需要保留的目录。
 
@@ -147,7 +147,7 @@ Chromium 用户数据（窗口状态等）不放在程序目录，固定存放�
 | `openBrowser` | `true` | 服务启动后自动打开浏览器 |
 | `autoStartDsh` | `false` | 启动器启动时自动运行 dsh |
 
-> `settings.json` 是唯一配置来源，可手动编辑。数值型字段接受数字或数字字符串（`"port": "4000"` 等价于 `4000`）；类型或取值确实非法的项（如 `"port": "abc"`、`"openBrowser": "yes"`、写成 URL 的 `host`）会回退到上表默认值，不会让启动流程出错。
+> `settings.json` 是唯一配置来源，可手动编辑。数值型字段接受数字或数字字符串（`"port": "4000"` 等价于 `4000`）；类型或取值确实非法的项（如 `"port": "abc"`、`"openBrowser": "yes"`、写成 URL 的 `host`）会回退到上表默认值，不会让启动流程出错。**改完不必重启启动器**：每次点「启动」或「检查并更新」都会重新读取该文件，改动立即生效。
 
 ## 环境信息与环境重置
 
@@ -192,9 +192,11 @@ Chromium 用户数据（窗口状态等）不放在程序目录，固定存放�
 ### 进程管理边界
 
 - 「停止」按 `runtime\dsh.pid` 记录的 PID 结束 dsh 进程；Windows 上 Node 只能终止单个进程，dsh 派生的子进程**不会被连带终止**，以更高权限或其它用户启动的实例也无法被普通权限的启动器结束。停止失败时启动器会**保持「运行中」状态并在主面板显示错误**，不会谎报已停止，也不会清掉 PID 记录。
-- **PID 复用保护**：结束上次会话遗留的记录前，启动器会先确认该记录里的端口仍在提供服务。这是**启发式证据而非 PID 身份证明**（纯 Node 无法反查端口属主），但足以挡住绝大多数「PID 被复用后误杀无关进程」的情况；端口明确空闲就只清理记录、绝不下杀手。升级前写入的旧记录没有端口信息：能按日志推算出端口就照常校验，推不出来才退回旧行为（直接结束该 PID）。
-- 若因 `host` 填成了本机不可用的地址而无法探测，启动时会显示「无法确认 dsh 状态」的错误并保留记录，停止也会报错而不是误清。
-- 启动器只接管**自己启动并留有 PID 记录**的 dsh；从命令行手工启动的、或 PID 记录超过 24 小时（按残留记录清理）的 dsh，启动器既不会接管也无法停止，此时再次「启动」会因默认端口被占用而落到 `+1` 端口，出现**两个 dsh 同时在跑**——请在任务管理器中结束多余的 node 进程。
+- **PID 复用保护**：结束上次会话遗留的记录前，启动器会先确认该记录里的端口仍在提供服务。这是**启发式证据而非 PID 身份证明**（纯 Node 无法反查端口属主），但足以挡住绝大多数「PID 被复用后误杀无关进程」的情况；端口明确空闲就只清理记录、绝不下杀手。升级前写入的旧记录没有端口信息：能按日志推算出端口就照常校验，推不出来才退回旧行为（直接结束该 PID）。**已知上限**：若 PID 被系统复用、且新占用者恰好在同一端口提供服务，仍可能误判——加一层「按 token 探测」看似更严格，但一旦探测失败就会让正常的接管实例变得无法停止，因此仍以端口为判据。
+- 记录里同时保存启动时使用的 `host`，所以改过 `settings.json` 的 `host` 再重启启动器，仍能认出在**旧地址**上运行的那个 dsh，既不会误清记录，也不会又起一个实例。（此保证适用于**本版本启动过**的 dsh；升级前遗留的旧记录没有 host 字段，只能按当前 `settings.host` 推断——若你恰好同时改过 host，那条旧记录仍可能被当成残留清掉，下次成功启动会重写记录，属一次性过渡问题。）
+- 若记录里的地址已经不可监听（网卡 / VPN / 主机名变化），启动器**既不会卡死、也不会擅自结束进程**：这种状态下无法证明那个 PID 仍是 dsh，误杀无关程序的代价更高，所以它会按「运行中」对待该记录，点「停止」时弹窗让你选「结束进程并清理记录 / 只清理记录（不结束进程）/ 取消」，日志里会写明探测了哪些地址；退出启动器时同样不会结束这类无法确认身份的进程，记录留给下次处理。必要时也可手动删除 `runtime\dsh.pid`。
+- **PID 记录不会因为运行时间长而过期**：只要记录的进程还活着就继续认它（早期版本按 24 小时丢弃记录，会把连续运行一天以上的 dsh 忘掉，导致停止谎报、再启动出现两个实例）。判断记录是否还有效一律看**端口是否仍在提供服务**：端口空闲就按残留记录清理且不杀进程；端口在服务才允许停止。
+- 启动器只接管**自己启动并留有 PID 记录**的 dsh；从命令行手工启动、或 `runtime\dsh.pid` 被删除的 dsh，启动器既不会接管也无法停止，此时再次「启动」会因默认端口被占用而落到 `+1` 端口，出现**两个 dsh 同时在跑**——请在任务管理器中结束多余的 node 进程。
 - 等待 dsh 打印服务地址的上限为 **60 秒**（首次启动要加载整个插件树，实测可达 13 秒以上）；到点后先探测端口，确认没有服务在听才会判定失败并结束该进程。写成 URL 或带端口的 `host` 会按上文设置表回退到 `127.0.0.1`；填成**当前不可用的地址**（如已失效的局域网 IP、解析不了的主机名）才会报「无法在本机监听」并提示检查设置，而不是把 51 个端口全报成「被占用」。
 
 ## 常见问题

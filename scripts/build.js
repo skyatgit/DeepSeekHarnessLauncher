@@ -32,7 +32,16 @@ function copyDir(src, dest) {
 }
 
 function moveIfExists(src, dest) {
-  if (fs.existsSync(src)) fs.renameSync(src, dest)
+  if (!fs.existsSync(src)) return
+  try {
+    fs.renameSync(src, dest)
+  } catch (e) {
+    // rename 是 MoveFileEx，跨卷（例如 %TEMP% 被重定向到别的盘）会抛 EXDEV：
+    // 这时退化为「递归复制 + 删除源」，与 NSIS 安装脚本里的 xcopy 回退同理
+    if (e.code !== 'EXDEV') throw e
+    fs.cpSync(src, dest, { recursive: true, force: true })
+    fs.rmSync(src, { recursive: true, force: true })
+  }
 }
 
 async function main() {
@@ -57,7 +66,7 @@ async function main() {
     for (const d of KEEP_DIRS) {
       const from = path.join(outDir, d)
       if (fs.existsSync(from)) {
-        fs.renameSync(from, path.join(backup, d))
+        moveIfExists(from, path.join(backup, d))
         moved.push(d)
       }
     }
@@ -82,15 +91,27 @@ async function main() {
     for (const d of moved) moveIfExists(path.join(backup, d), path.join(outDir, d))
     rmrf(backup)
   } catch (err) {
-    // 任何一步失败都不能把用户的运行数据留在 %TEMP%：先放回 dist\ 再抛出
+    // 任何一步失败都不能把用户的运行数据留在 %TEMP%：逐个放回 dist\，并如实报告哪些没放回
+    const stranded = []
     try {
       fs.mkdirSync(outDir, { recursive: true })
-      for (const d of moved) moveIfExists(path.join(backup, d), path.join(outDir, d))
-      rmrf(backup)
-      console.error('构建中断，运行数据已放回 ' + outDir)
+      for (const d of moved) {
+        try { moveIfExists(path.join(backup, d), path.join(outDir, d)) } catch (e) { stranded.push(d) }
+      }
     } catch (e) {
-      console.error('构建中断，且运行数据未能放回！请手动从以下目录恢复：')
-      console.error('  ' + backup)
+      // 连 outDir 都建不出来：把所有搬走过的目录都记为待恢复
+      for (const d of moved) if (!stranded.includes(d)) stranded.push(d)
+    }
+    if (moved.length === 0) {
+      // 备份阶段就失败了（例如跨卷且复制也失败）：没有数据被搬走，dist 保持原样
+      rmrf(backup)
+      console.error('构建中断，尚未搬动任何运行数据，' + outDir + ' 保持原样')
+    } else if (stranded.length === 0) {
+      rmrf(backup)
+      console.error('构建中断，运行数据已全部放回 ' + outDir)
+    } else {
+      console.error('构建中断，以下运行数据未能放回：' + stranded.join('、'))
+      console.error('它们仍在 ' + backup + ' ，请手动移回 ' + outDir)
     }
     throw err
   }
