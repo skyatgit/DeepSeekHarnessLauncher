@@ -5,7 +5,7 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 它把「下载运行时 → 拉取源码 → 安装依赖 → 构建 → 启动 Web UI」整条流程自动化，用户**无需预装 Node.js、Git 或 pnpm**，双击即用。
 
 - 仓库地址：https://github.com/skyatgit/DeepSeekHarnessLauncher
-- 应用版本：`1.0.0`（Electron `44.0.0`，electron-builder `26.x`）
+- 应用版本：`1.0.1`（Electron `44.0.0`，electron-builder `26.x`）
 - 目标平台：Windows 10/11（x64 / ARM64）
 - 被启动的目标：[`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness)（默认分支 `master`）
 
@@ -24,7 +24,7 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 | 🧰 环境总览 | 环境依赖清单**两列**展示（Node.js / Git / pnpm / 源码 / 依赖 / 用户数据 / 设置 / 缓存），显示就绪状态、版本与路径，点击路径直达资源管理器 |
 | 🔌 端口自动避让 | 默认端口（`3080`）被占用时自动向后探测可用端口（最多 +50） |
 | ⚡ 开机自启 | 支持「开机自启」与「启动器启动时自动运行 dsh」两个独立开关 |
-| 🧲 全局单实例 | 安装版 / 便携版 / 开发版互斥，同一时间只允许运行一个启动器，重复启动只唤起主面板；可接管外部启动的 dsh 进程（停止 / 打开界面） |
+| 🧲 全局单实例 | 安装版 / 便携版 / 开发版互斥，同一时间只允许运行一个启动器，重复启动只唤起主面板；可接管**由本启动器启动**（`runtime\dsh.pid` 有记录）的 dsh 进程（停止 / 打开界面） |
 | 🚪 灵活退出 | 退出时可选择「停止 dsh 并退出」或「保持 dsh 后台运行，仅退出启动器」 |
 | 📴 离线可用 | GitHub 不可达时自动跳过更新检查，使用本地已就绪的环境离线运行 |
 
@@ -58,7 +58,7 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 | 命令 | 说明 |
 | --- | --- |
 | `npm run build` | 运行 `scripts\build.js`：组装 `dist\`——复制 Electron 运行时、重命名 `DeepSeekHarnessLauncher.exe`、把 6 个源文件拷入 `resources\app\`、备份并还原运行数据（`runtime\`/`cache\`/`data\`/`config\`/`logs\`，重建不清空环境）、用 `rcedit` 写入 exe 图标。产物 `dist\` 即自带运行时的可分发版本 |
-| `npm run dist` | 用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.0.exe`。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
+| `npm run dist` | 先清空 `release\`（`scripts\clean.js`），再用 electron-builder 打 NSIS 安装包（x64）到 `release\`：`DeepSeekHarness-Setup-1.0.1.exe`。产物目录只保留本次构建结果，不会残留旧版本安装包。可自定义安装目录（per-user），自动创建桌面 / 开始菜单快捷方式 |
 
 ### GitHub Actions 自动构建与发布
 
@@ -68,7 +68,7 @@ DeepSeekHarnessLauncher 是 [DeepSeek Harness](https://github.com/deepseek-ai/de
 
 1. 更新 `package.json` 的 `version`（安装包文件名带版本号）；
 2. 提交并推送；
-3. 打标签并推送：`git tag v1.0.0 && git push origin v1.0.0`；
+3. 打标签并推送：`git tag v1.0.1 && git push origin v1.0.1`；
 4. 等待 Actions 完成，Release 页面即可下载 `DeepSeekHarness-Setup-<version>.exe`。
 
 > 提示：当前安装包未做代码签名，Windows SmartScreen 可能显示"未知发布者"提示，属预期现象。
@@ -93,9 +93,10 @@ DeepSeekHarnessLauncher\
 ├── package.json               # 应用清单与 electron-builder 构建配置
 ├── scripts\
 │   ├── build.js               # 组装 dist\（npm run build）
+│   ├── clean.js               # 打包前清空输出目录（npm run dist 的第一步）
 │   └── installer-extra.nsh    # NSIS 安装器扩展（升级数据保留 / 更新检测 / 目录授权）
 ├── dist\                      # 构建产物（运行时生成）：自带 Electron 运行时的可分发版本
-├── release\                   # 安装包产物（运行时生成）
+├── release\                   # 安装包产物（每次 npm run dist 先清空，只留本次结果）
 ├── runtime\  source\  data\  config\  logs\  cache\
 │                              # 运行数据（运行时自动生成，见下表）
 └── .gitignore
@@ -118,7 +119,7 @@ DeepSeekHarnessLauncher\
 ├── config\settings.json       # 启动器设置（首次运行自动生成）
 ├── data\                      # 用户数据（DSH_HOME：会话 / 配置 / 密钥）
 ├── cache\                     # 下载缓存（安装包 / npm 缓存）
-└── logs\launcher.log          # 运行日志
+└── logs\launcher.log          # 运行日志（超过 5 MB 自动轮转为 launcher.log.1 / .2）
 ```
 
 Chromium 用户数据（窗口状态等）不放在程序目录，固定存放于 `%APPDATA%\DeepSeekHarnessLauncher\user-data`。
@@ -138,6 +139,8 @@ Chromium 用户数据（窗口状态等）不放在程序目录，固定存放�
 | `updateCheck` | `auto` | 启动时自动检查更新（`off` 关闭） |
 | `openBrowser` | `true` | 服务启动后自动打开浏览器 |
 | `autoStartDsh` | `false` | 启动器启动时自动运行 dsh |
+
+> `settings.json` 是唯一配置来源，可手动编辑。数值型字段接受数字或数字字符串（`"port": "4000"` 等价于 `4000`）；类型或取值确实非法的项（如 `"port": "abc"`、`"openBrowser": "yes"`、写成 URL 的 `host`）会回退到上表默认值，不会让启动流程出错。
 
 ## 环境信息与环境重置
 
@@ -159,7 +162,7 @@ Chromium 用户数据（窗口状态等）不放在程序目录，固定存放�
 ## 源码更新与构建产物清理
 
 - 启动时（`updateCheck: auto`）与「检查并更新」都会对比远程 `master` 分支，有新提交则 `fetch + reset --hard` 更新。
-- 由于 `git reset --hard` 只同步受版本管理的文件，**每次更新后启动器会自动清理上一版本的编译产物**（源码树下的全部 `lib\` / `dist\` 目录与 `*.tsbuildinfo` 文件，跳过 `node_modules`），避免旧产物污染新版本构建（曾因此类残留导致 MISSING_EXPORT 构建失败）。
+- 由于 `git reset --hard` 只同步受版本管理的文件，**每次更新后启动器会自动清理上一版本的编译产物**（源码树下的全部 `lib\` / `dist\` 目录与 `*.tsbuildinfo` 文件，跳过 `node_modules`、`.git` 与符号链接/junction），避免旧产物污染新版本构建（曾因此类残留导致 MISSING_EXPORT 构建失败）。
 - 若构建仍异常，可删除 `source\` 目录后重新启动，进行干净的重新克隆与构建。
 
 ## dsh 的启动入口
@@ -175,14 +178,24 @@ Chromium 用户数据（窗口状态等）不放在程序目录，固定存放�
 
 ## 单实例机制
 
-启动器使用全局单实例锁（`dsh-launcher`），**安装版、便携版与开发版互斥**——同一时间只能运行一个，重复启动会自动唤起已在运行的实例。
+启动器是**全局单实例**的：**安装版、便携版与开发版互斥**——同一时间只能运行一个，重复启动会自动唤起已在运行的实例。
 
-实现要点：Electron 的单实例锁在 Windows 上按 userData 目录划作用域，因此所有版本共享同一份 Chromium 用户数据（`%APPDATA%\DeepSeekHarnessLauncher\user-data`），锁才能跨位置全局生效；这也意味着各版本共享窗口大小/位置等界面状态。
+实现要点：Electron 的单实例锁在 Windows 上按 userData 目录划作用域（`app.requestSingleInstanceLock()` 的参数只是传给首实例的 additionalData，并不是锁名），因此所有版本共享同一份 Chromium 用户数据（`%APPDATA%\DeepSeekHarnessLauncher\user-data`），锁才能跨位置全局生效；这也意味着各版本共享窗口大小/位置等界面状态。
+
+### 进程管理边界
+
+- 「停止」按 `runtime\dsh.pid` 记录的 PID 结束 dsh 进程；Windows 上 Node 只能终止单个进程，dsh 派生的子进程**不会被连带终止**，以更高权限或其它用户启动的实例也无法被普通权限的启动器结束。停止失败时启动器会**保持「运行中」状态并在主面板显示错误**，不会谎报已停止，也不会清掉 PID 记录。
+- **PID 复用保护**：结束上次会话遗留的记录前，启动器会先确认该记录里的端口仍在提供服务。这是**启发式证据而非 PID 身份证明**（纯 Node 无法反查端口属主），但足以挡住绝大多数「PID 被复用后误杀无关进程」的情况；端口明确空闲就只清理记录、绝不下杀手。升级前写入的旧记录没有端口信息：能按日志推算出端口就照常校验，推不出来才退回旧行为（直接结束该 PID）。
+- 若因 `host` 填成了本机不可用的地址而无法探测，启动时会显示「无法确认 dsh 状态」的错误并保留记录，停止也会报错而不是误清。
+- 启动器只接管**自己启动并留有 PID 记录**的 dsh；从命令行手工启动的、或 PID 记录超过 24 小时（按残留记录清理）的 dsh，启动器既不会接管也无法停止，此时再次「启动」会因默认端口被占用而落到 `+1` 端口，出现**两个 dsh 同时在跑**——请在任务管理器中结束多余的 node 进程。
+- 等待 dsh 打印服务地址的上限为 **60 秒**（首次启动要加载整个插件树，实测可达 13 秒以上）；到点后先探测端口，确认没有服务在听才会判定失败并结束该进程。写成 URL 或带端口的 `host` 会按上文设置表回退到 `127.0.0.1`；填成**当前不可用的地址**（如已失效的局域网 IP、解析不了的主机名）才会报「无法在本机监听」并提示检查设置，而不是把 51 个端口全报成「被占用」。
 
 ## 常见问题
 
 - **首次启动很慢？** 正常。首次运行需下载运行时（Node.js + MinGit + pnpm）并克隆、安装、构建整个 DeepSeek Harness，约 10~30 分钟，进度可在主面板日志与步骤条实时查看。
-- **GitHub 连接失败？** 启动器会自动跳过更新检查并使用本地环境离线运行；若本地从未成功准备过环境，请检查网络或代理后重试。
+- **GitHub 连接失败？** 启动器会自动跳过更新检查并使用本地环境离线运行；若本地从未成功准备过环境，请检查网络或代理后重试。离线时点「检查并更新」会明确提示「未能检查更新」，不会谎报「已是最新版本」。
+- **卡在「启动服务」很久？** 正常范围内。首次启动要加载整个插件树，启动器最多等待 60 秒 dsh 打印服务地址；到点后会先探测端口，确认确实没有服务在听才判定失败。
+- **日志会越来越大吗？** 不会。`logs\launcher.log` 超过 5 MB 会自动轮转为 `launcher.log.1`（旧的 `.1` 顺延为 `.2`，更早的丢弃），正常情况最多占用约 15 MB；查看日志文件夹即可看到最多三份文件。启动时只回读日志尾部，并在当前日志里找不到服务地址时依次回退到 `.1` / `.2`，因此轮转不会影响「打开 Web UI」。
 - **端口被占用？** 启动器会自动从 `settings.json` 的 `port` 起向后探测可用端口（最多 +50），无需手动处理。
 - **想彻底重置？** 退出启动器后，按上文「环境信息与环境重置」手动删除对应目录即可回到首次安装状态。
 - **同时运行了两个启动器？** 单实例锁按用户会话生效：请确认两个实例都以**同一 Windows 用户、相同的权限级别**运行（一个以管理员运行、另一个普通运行时会绕过互斥体，属 Windows 安全边界）。
